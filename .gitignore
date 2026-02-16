@@ -1,0 +1,5 @@
+backend/__pycache__/
+backend/workspaces/
+persistent_jobs/
+terraform/envs/dev/.terraform/
+terraform/envs/dev/.terraform.lock.hcl
