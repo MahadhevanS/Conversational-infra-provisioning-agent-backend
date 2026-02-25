@@ -26,16 +26,16 @@ def generate_main_tf(blueprint: dict):
     if blueprint["type"] == "ec2":
 
         return f"""
-provider "aws" {{
-  region = "us-east-1"
-}}
+          provider "aws" {{
+            region = "us-east-1"
+          }}
 
-resource "aws_instance" "app" {{
-  ami           = "{blueprint['ami']}"
-  instance_type = "{blueprint['instance_type']}"
+          resource "aws_instance" "app" {{
+            ami           = "{blueprint['ami']}"
+            instance_type = "{blueprint['instance_type']}"
 
-  tags = {{
-    Name = "{blueprint['name']}"
-  }}
-}}
-"""
+            tags = {{
+              Name = "{blueprint['name']}"
+            }}
+          }}
+          """

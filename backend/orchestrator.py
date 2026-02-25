@@ -3,92 +3,319 @@ import os
 import json
 import shutil
 import platform
+import threading
 from tfvars_generator import generate_tfvars
 from terraform.executor import TerraformExecutor
-from terraform.workspace import generate_tf_from_blueprint
 
-ENV_MAP = {
-    "development": "dev",
-    "dev": "dev",
-    "production": "prod",
-    "prod": "prod",
-    "test": "test"
-}
-
-JOBS_BASE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "persistent_jobs")
+# --- PATHS ---
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+JOBS_BASE_DIR = os.path.join(PROJECT_ROOT, "persistent_jobs")
 os.makedirs(JOBS_BASE_DIR, exist_ok=True)
 
-def terraform_plan(blueprint, job_id): # Add job_id parameter
-    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    MODULES_PATH = os.path.join(PROJECT_ROOT, "terraform", "modules")
+# --- GLOBAL LOCKS ---
+# Prevents multiple Terraform instances from running in the same Env (e.g., 'prod')
+ENV_LOCKS = {}
+
+def get_env_lock(env_name):
+    if env_name not in ENV_LOCKS:
+        ENV_LOCKS[env_name] = threading.Lock()
+    return ENV_LOCKS[env_name]
+
+# --- HELPERS ---
+def get_workspace_path(job_id, env_name):
+    """Utility to map job IDs to specific file system locations."""
+    env_folder = "prod" if "prod" in env_name.lower() else "dev"
+    return os.path.join(JOBS_BASE_DIR, job_id, "terraform", "envs", env_folder)
+
+def find_latest_state(env_name):
+    """Searches past jobs to find the most recent terraform.tfstate."""
+    env_folder = "prod" if "prod" in env_name.lower() else "dev"
+    job_ids = sorted(os.listdir(JOBS_BASE_DIR), reverse=True) # Newest first
     
-    # Define a specific persistent path for THIS job
-    job_dir = os.path.join(JOBS_BASE_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
+    for job_id in job_ids:
+        state_path = os.path.join(JOBS_BASE_DIR, job_id, "terraform", "envs", env_folder, "terraform.tfstate")
+        if os.path.exists(state_path):
+            return state_path
+    return None
+
+def format_access_points(outputs):
+    access = []
+
+    if "alb_dns_name" in outputs:
+        access.append({
+            "service": "Web Application",
+            "url": f"http://{outputs['alb_dns_name']['value']}"
+        })
+
+    if "ec2_public_ip" in outputs:
+        access.append({
+            "service": "EC2 Server",
+            "url": f"http://{outputs['ec2_public_ip']['value']}"
+        })
+
+    if "s3_website_url" in outputs:
+        access.append({
+            "service": "Static Website",
+            "url": f"http://{outputs['s3_website_url']['value']}"
+        })
+
+    if "rds_endpoint" in outputs:
+        access.append({
+            "service": "Database",
+            "endpoint": outputs["rds_endpoint"]["value"]
+        })
+
+    return access
+
+# --- CORE LOGIC ---
+
+def terraform_plan(blueprint, job_id):
+    try:
+        env = blueprint.get("environment", "development").lower()
+        workspace_path = get_workspace_path(job_id, env)
+        
+        # 1. Prepare Directory Structure
+        os.makedirs(workspace_path, exist_ok=True)
+        
+        # 2. Sync Source Files
+        source_env = "prod" if "prod" in env else "dev"
+        source_dir = os.path.join(PROJECT_ROOT, "terraform", "envs", source_env)
+        
+        for item in os.listdir(source_dir):
+            s = os.path.join(source_dir, item)
+            d = os.path.join(workspace_path, item)
+            if os.path.isfile(s) and s.endswith(".tf"):
+                shutil.copy2(s, d)
+
+        # 2. Inject Latest State (Crucial for Modify/Terminate)
+        latest_state = find_latest_state(env)
+        if latest_state:
+            shutil.copy2(latest_state, os.path.join(workspace_path, "terraform.tfstate"))
+
+        # 3. Handle Modules (Symlink)
+        modules_src = os.path.join(PROJECT_ROOT, "terraform", "modules")
+        modules_dst = os.path.join(JOBS_BASE_DIR, job_id, "terraform", "modules")
+        os.makedirs(os.path.dirname(modules_dst), exist_ok=True)
+        
+        if not os.path.exists(modules_dst):
+            if platform.system() == "Windows":
+                subprocess.run(['cmd', '/c', 'mklink', '/j', modules_dst, modules_src], check=True)
+            else:
+                os.symlink(modules_src, modules_dst)
+
+        # 4. Execute Plan with Locking
+        with get_env_lock(env):
+            tfvars_path = generate_tfvars(blueprint, workspace_path)
+            
+            # Init
+            subprocess.run(["terraform", "init", "-no-color", "-input=false"], 
+                           cwd=workspace_path, capture_output=True, check=True)
+            
+            # Plan
+            plan_proc = subprocess.run(
+                ["terraform", "plan", f"-var-file={tfvars_path}", "-out=tfplan", "-no-color"],
+                cwd=workspace_path, capture_output=True, text=True
+            )
+            
+            if plan_proc.returncode != 0:
+                return {"error": plan_proc.stderr}
+
+            # Show Structured JSON
+            show_json = subprocess.run(["terraform", "show", "-json", "tfplan"], 
+                                       cwd=workspace_path, capture_output=True, text=True)
+            
+            return {
+                "raw_plan": plan_proc.stdout,
+                "structured_plan": json.loads(show_json.stdout)
+            }
+
+    except Exception as e:
+        return {"error": f"Orchestrator Plan Error: {str(e)}"}
+
+# def terraform_apply(plan_job_id, blueprint):
+#     try:
+#         env = blueprint.get("environment", "development").lower()
+#         # Find the path where the 'PLAN' was created
+#         workspace_path = get_workspace_path(plan_job_id, env)
+        
+#         if not os.path.exists(os.path.join(workspace_path, "tfplan")):
+#             return {"error": "Binary plan file 'tfplan' not found in workspace."}
+
+#         with get_env_lock(env):
+#             # Safe Apply (runs 'terraform apply tfplan')
+#             executor = TerraformExecutor(workspace_path)
+#             logs = executor.safe_apply()
+            
+#             # Get Outputs
+#             out_proc = subprocess.run(["terraform", "output", "-json"], 
+#                                       cwd=workspace_path, capture_output=True, text=True)
+            
+#             access_info = format_access_points(json.loads(out_proc.stdout))
+
+#             return {
+#                 "logs": logs,
+#                 "outputs": json.loads(out_proc.stdout) if out_proc.returncode == 0 else {},
+#                 "access": access_info
+#             }
+
+#     except Exception as e:
+#         return {"error": f"Orchestrator Apply Error: {str(e)}"}
+    
+def terraform_apply(plan_job_id, blueprint):
+    try:
+        env = blueprint.get("environment", "development").lower()
+        workspace_path = get_workspace_path(plan_job_id, env)
+
+        if not os.path.exists(os.path.join(workspace_path, "tfplan")):
+            return {"error": "Binary plan file 'tfplan' not found in workspace."}
+
+        with get_env_lock(env):
+
+            executor = TerraformExecutor(workspace_path)
+            apply_result = executor.safe_apply()
+
+            # -------------------------------------------------
+            # APPLY FAILED
+            # -------------------------------------------------
+            if apply_result.get("status") != "SUCCESS":
+
+                error_logs = apply_result.get("logs", {})
+                stderr_text = error_logs.get("stderr", "")
+
+                failed_resource = None
+                created_resources = []
+
+                # Extract failed resource
+                import re
+                match = re.search(r'with\s+([^\s,]+)', stderr_text)
+                if match:
+                    failed_resource = match.group(1)
+
+                # Get successfully created resources
+                state_proc = subprocess.run(
+                    ["terraform", "state", "list"],
+                    cwd=workspace_path,
+                    capture_output=True,
+                    text=True
+                )
+
+                if state_proc.returncode == 0:
+                    created_resources = [
+                        r.strip()
+                        for r in state_proc.stdout.splitlines()
+                        if r.strip()
+                    ]
+
+                return {
+                    "error": stderr_text or "Terraform apply failed.",
+                    "failed_resource": failed_resource,
+                    "created_resources": created_resources
+                }
+
+            # -------------------------------------------------
+            # APPLY SUCCESS
+            # -------------------------------------------------
+            out_proc = subprocess.run(
+                ["terraform", "output", "-json"],
+                cwd=workspace_path,
+                capture_output=True,
+                text=True
+            )
+
+            outputs = json.loads(out_proc.stdout) if out_proc.returncode == 0 else {}
+            access_info = format_access_points(outputs)
+
+            return {
+                "outputs": outputs,
+                "access": access_info
+            }
+
+    except Exception as e:
+        return {"error": f"Orchestrator Apply Error: {str(e)}"}
+
+# =====================================================
+# DESTROY
+# =====================================================
+
+def terraform_destroy(blueprint):
 
     try:
         env = blueprint.get("environment", "development").lower()
         env_folder = ENV_MAP.get(env, "dev")
-        source_dir = os.path.join(PROJECT_ROOT, "terraform", "envs", env_folder)
 
-        fake_env_path = os.path.join(job_dir, "terraform", "envs", env_folder)
-        fake_modules_path = os.path.join(job_dir, "terraform", "modules")
-        
-        # Ensure the parent of the modules path exists (the 'terraform' folder)
-        os.makedirs(os.path.dirname(fake_modules_path), exist_ok=True)
-        os.makedirs(fake_env_path, exist_ok=True)
+        # Find latest workspace for this environment
+        for job_id in os.listdir(JOBS_BASE_DIR):
+            candidate = os.path.join(
+                JOBS_BASE_DIR,
+                job_id,
+                "terraform",
+                "envs",
+                env_folder
+            )
+            if os.path.exists(candidate):
+                workspace_path = candidate
+                break
+        else:
+            return {"error": "No deployed environment found."}
 
-        # 2. Symlink/Junction Modules
-        if os.path.exists(MODULES_PATH) and not os.path.exists(fake_modules_path): # Check if exists
-            if platform.system() == "Windows":
-                # mklink /j requires the destination to NOT exist yet
-                subprocess.run(['cmd', '/c', 'mklink', '/j', fake_modules_path, MODULES_PATH], check=True)
-            else:
-                os.symlink(MODULES_PATH, fake_modules_path)
+        lock = get_env_lock(env)
 
-        # 3. Copy .tf files
-        for item in os.listdir(source_dir):
-            s = os.path.join(source_dir, item)
-            d = os.path.join(fake_env_path, item)
-            if os.path.isfile(s) and s.endswith(".tf"):
-                shutil.copy2(s, d)
+        with lock:
 
-        # 4. Generate vars and Run Plan
-        tfvars_path = generate_tfvars(blueprint, fake_env_path)
-        
-        subprocess.run(["terraform", "init", "-no-color", "-input=false"], cwd=fake_env_path, capture_output=True)
-        
-        plan = subprocess.run(
-            ["terraform", "plan", f"-var-file={tfvars_path}", "-out=tfplan", "-no-color"],
-            cwd=fake_env_path, capture_output=True, text=True
-        )
+            destroy_proc = subprocess.run(
+                ["terraform", "destroy", "-auto-approve", "-no-color"],
+                cwd=workspace_path,
+                capture_output=True,
+                text=True
+            )
 
-        show_json = subprocess.run(["terraform", "show", "-json", "tfplan"], cwd=fake_env_path, capture_output=True, text=True)
+            if destroy_proc.returncode != 0:
+                return {"error": destroy_proc.stderr}
 
-        return {"raw": plan.stdout, "structured": show_json.stdout}
+            return {"message": "Environment destroyed successfully."}
+
     except Exception as e:
-        return f"ORCHESTRATOR CRASH: {str(e)}"
+        return {"error": f"DESTROY CRASH: {str(e)}"}
 
-def terraform_apply(job_id, blueprint):
-    # Find the folder created during the plan phase
-    env = blueprint.get("environment", "development").lower()
+# =====================================================
+# STATUS
+# =====================================================
+
+def terraform_status(environment):
+
+    env = environment.lower()
     env_folder = ENV_MAP.get(env, "dev")
-    job_dir = os.path.join(JOBS_BASE_DIR, job_id, "terraform", "envs", env_folder)
-    
-    plan_path = os.path.join(job_dir, "tfplan")
-    if not os.path.exists(job_dir):
-        return "ERROR: Planned file 'tfplan' not found. You must plan before applying."
 
-    # Use the existing tfplan file
-    executor = TerraformExecutor(job_dir)
-    apply_result = executor.safe_apply() # Ensure safe_apply runs 'terraform apply tfplan'
+    for job_id in os.listdir(JOBS_BASE_DIR):
+        candidate = os.path.join(
+            JOBS_BASE_DIR,
+            job_id,
+            "terraform",
+            "envs",
+            env_folder
+        )
+        if os.path.exists(candidate):
+            workspace_path = candidate
+            break
+    else:
+        return {"status": "NOT_DEPLOYED"}
 
-    output_proc = subprocess.run(
-        ["terraform", "output", "-json"],
-        cwd=job_dir, capture_output=True, text=True
-    )
-    
-    return {
-        "logs": apply_result,
-        "outputs": json.loads(output_proc.stdout) if output_proc.returncode == 0 else {}
-    }
+    state_file = os.path.join(workspace_path, "terraform.tfstate")
+
+    if not os.path.exists(state_file):
+        return {"status": "PLANNED"}
+
+    try:
+        state_data = json.load(open(state_file))
+        resources = [
+            r["type"]
+            for r in state_data.get("resources", [])
+        ]
+
+        return {
+            "status": "DEPLOYED",
+            "resources": resources
+        }
+
+    except Exception:
+        return {"status": "UNKNOWN"}

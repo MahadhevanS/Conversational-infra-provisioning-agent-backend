@@ -18,7 +18,6 @@ class TerraformExecutor:
             cwd=self.working_dir,
             capture_output=True,
             text=True,
-            timeout=300
         )
 
         return {

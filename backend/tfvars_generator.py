@@ -1,32 +1,3 @@
-# import os
-
-# def generate_tfvars(blueprint, terraform_dir):
-
-#     tfvars_path = os.path.join(terraform_dir, "terraform.tfvars")
-
-#     instance_type = None
-#     environment = blueprint.get("environment", "dev")
-
-#     # ------------------------------------------------
-#     # Extract from components[]
-#     # ------------------------------------------------
-#     for comp in blueprint.get("components", []):
-
-#         if comp["type"] == "compute":
-#             instance_type = comp["compute"]["instance_type"]
-
-#     # ------------------------------------------------
-#     # Write tfvars
-#     # ------------------------------------------------
-#     with open(tfvars_path, "w") as f:
-
-#         if instance_type:
-#             f.write(f'instance_type = "{instance_type}"\n')
-
-#         f.write(f'environment = "{environment}"\n')
-
-#     return tfvars_path
-
 import os
 import json
 
@@ -116,4 +87,6 @@ def generate_tfvars(blueprint, terraform_dir):
     with open(tfvars_path, "w") as f:
         json.dump(tfvars, f, indent=2)
 
+    print("Generated TFVars:", tfvars)
+    
     return tfvars_path
