@@ -13,7 +13,6 @@ JOBS_BASE_DIR = os.path.join(PROJECT_ROOT, "persistent_jobs")
 os.makedirs(JOBS_BASE_DIR, exist_ok=True)
 
 # --- GLOBAL LOCKS ---
-# Prevents multiple Terraform instances from running in the same Env (e.g., 'prod')
 ENV_LOCKS = {}
 
 def get_env_lock(env_name):
@@ -124,42 +123,19 @@ def terraform_plan(blueprint, job_id):
             show_json = subprocess.run(["terraform", "show", "-json", "tfplan"], 
                                        cwd=workspace_path, capture_output=True, text=True)
             
+            structured_plan = json.loads(show_json.stdout) if show_json.returncode == 0 else {}
+            plan_json_path = os.path.join(workspace_path, "plan.json")
+            with open(plan_json_path, "w") as f:
+                json.dump(structured_plan, f)
+                
             return {
                 "raw_plan": plan_proc.stdout,
-                "structured_plan": json.loads(show_json.stdout)
+                "structured_plan": structured_plan
             }
 
     except Exception as e:
         return {"error": f"Orchestrator Plan Error: {str(e)}"}
 
-# def terraform_apply(plan_job_id, blueprint):
-#     try:
-#         env = blueprint.get("environment", "development").lower()
-#         # Find the path where the 'PLAN' was created
-#         workspace_path = get_workspace_path(plan_job_id, env)
-        
-#         if not os.path.exists(os.path.join(workspace_path, "tfplan")):
-#             return {"error": "Binary plan file 'tfplan' not found in workspace."}
-
-#         with get_env_lock(env):
-#             # Safe Apply (runs 'terraform apply tfplan')
-#             executor = TerraformExecutor(workspace_path)
-#             logs = executor.safe_apply()
-            
-#             # Get Outputs
-#             out_proc = subprocess.run(["terraform", "output", "-json"], 
-#                                       cwd=workspace_path, capture_output=True, text=True)
-            
-#             access_info = format_access_points(json.loads(out_proc.stdout))
-
-#             return {
-#                 "logs": logs,
-#                 "outputs": json.loads(out_proc.stdout) if out_proc.returncode == 0 else {},
-#                 "access": access_info
-#             }
-
-#     except Exception as e:
-#         return {"error": f"Orchestrator Apply Error: {str(e)}"}
     
 def terraform_apply(plan_job_id, blueprint):
     try:
@@ -233,6 +209,61 @@ def terraform_apply(plan_job_id, blueprint):
     except Exception as e:
         return {"error": f"Orchestrator Apply Error: {str(e)}"}
 
+
+# =====================================================
+# COST ESTIMATION
+# =====================================================
+
+def terraform_cost(plan_job_id, blueprint):
+    try:
+        env = blueprint.get("environment", "development").lower()
+        workspace_path = get_workspace_path(plan_job_id, env)
+
+        plan_json_path = os.path.join(workspace_path, "plan.json")
+
+        # Ensure structured plan exists
+        if not os.path.exists(plan_json_path):
+            return {"error": "plan.json not found. Run plan first."}
+
+        with get_env_lock(env):
+
+            # Run Infracost breakdown
+            cost_proc = subprocess.run(
+                [
+                    "infracost",
+                    "breakdown",
+                    "--path", plan_json_path,
+                    "--format", "json"
+                ],
+                cwd=workspace_path,
+                capture_output=True,
+                text=True
+            )
+
+            if cost_proc.returncode != 0:
+                return {"error": cost_proc.stderr}
+
+            cost_data = json.loads(cost_proc.stdout)
+
+            # Extract Summary
+            total_monthly = cost_data.get("totalMonthlyCost")
+            currency = cost_data.get("currency", "USD")
+
+            summary = {}
+            if total_monthly is not None:
+                summary = {
+                    "monthly_cost": float(total_monthly),
+                    "currency": currency
+                }
+
+            return {
+                "cost_summary": summary,
+                "raw_cost": cost_data
+            }
+
+    except Exception as e:
+        return {"error": f"Orchestrator Cost Error: {str(e)}"}
+    
 # =====================================================
 # DESTROY
 # =====================================================

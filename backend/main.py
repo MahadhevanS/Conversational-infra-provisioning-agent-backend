@@ -5,13 +5,11 @@ import threading
 import time
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from orchestrator import terraform_plan, terraform_apply, terraform_destroy
+from orchestrator import terraform_plan, terraform_apply, terraform_destroy, terraform_cost
 from lex import lex_webhook
 
 app = FastAPI()
 
-# --- PERSISTENCE SETUP ---
-# Store job metadata in a JSON file so it survives server restarts
 DB_FILE = "jobs_db.json"
 
 def load_db():
@@ -47,7 +45,6 @@ def update_job_status(job_id, status, result=None):
 def run_plan_worker(job_id, blueprint, env):
     try:
         update_job_status(job_id, "RUNNING")
-        # The orchestrator handles the heavy lifting in a unique folder
         result = terraform_plan(blueprint, job_id)
         
         if "error" in result:
@@ -56,19 +53,6 @@ def run_plan_worker(job_id, blueprint, env):
             update_job_status(job_id, "COMPLETED", result["structured_plan"])
     except Exception as e:
         update_job_status(job_id, "FAILED", str(e))
-
-# def run_apply_worker(job_id, plan_job_id, blueprint):
-#     try:
-#         update_job_status(job_id, "RUNNING")
-#         # Apply specifically looks for the 'tfplan' file in the plan_job_id folder
-#         result = terraform_apply(plan_job_id, blueprint)
-        
-#         if "error" in result:
-#             update_job_status(job_id, "FAILED", result["error"])
-#         else:
-#             update_job_status(job_id, "COMPLETED", result["outputs"])
-#     except Exception as e:
-#         update_job_status(job_id, "FAILED", str(e))
 
 def run_apply_worker(job_id, plan_job_id, blueprint):
     try:
@@ -84,6 +68,18 @@ def run_apply_worker(job_id, plan_job_id, blueprint):
     except Exception as e:
         update_job_status(job_id, "FAILED", str(e))
                 
+def run_cost_worker(job_id: str, run_id: str,blueprint):
+    try:
+        update_job_status(job_id, "RUNNING")
+        result = terraform_cost(run_id,blueprint)  # cost runs in background inside orchestrator
+
+        if "error" in result:
+            update_job_status(job_id, "FAILED", result)
+        else:
+            update_job_status(job_id, "COMPLETED", result)
+    except Exception as e:
+        update_job_status(job_id, "FAILED", str(e))
+
 # --- ROUTES ---
 
 @app.post("/lex-webhook")
@@ -106,6 +102,35 @@ def plan_infra(payload: dict):
 
     threading.Thread(target=run_plan_worker, args=(job_id, blueprint, env)).start()
     return {"status": "accepted", "job_id": job_id}
+
+@app.post("/cost")
+def cost_infra(payload: dict):
+    run_id = payload.get("run_id")
+    blueprint = payload.get("infra_blueprint") or payload
+    if not run_id:
+        raise HTTPException(status_code=400, detail="run_id required")
+
+    job_id = f"cost-{uuid.uuid4()}"
+
+    jobs[job_id] = {
+        "status": "PENDING",
+        "type": "COST",
+        "run_id": run_id,
+        "created_at": time.time()
+    }
+    save_db(jobs)
+
+    threading.Thread(
+        target=run_cost_worker,
+        args=(job_id, run_id,blueprint),
+        daemon=True
+    ).start()
+
+    return {
+        "status": "accepted",
+        "job_id": job_id,
+        "run_id": run_id
+    }
 
 @app.post("/apply")
 def apply_infra(payload: dict):
@@ -174,6 +199,10 @@ def get_status(job_id: str):
             response["outputs"] = result.get("outputs", {})
             response["access"] = result.get("access", [])
 
+        elif job.get("type") == "COST":
+            result = job["result"]
+            response["cost_summary"] = result.get("cost_summary", {})
+            
     # If failed
     if job.get("status") == "FAILED":
         response["error"] = job.get("result")

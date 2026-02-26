@@ -1,5 +1,3 @@
 terraform {
-  backend "local" {
-    path = "dev.tfstate"
-  }
+  backend "local" {}
 }

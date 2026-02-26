@@ -3,3 +3,7 @@ backend/workspaces/
 persistent_jobs/
 terraform/envs/dev/.terraform/
 terraform/envs/dev/.terraform.lock.hcl
+terraform/envs/dev/terraform.tfstate.backup/
+terraform/envs/dev/terraform.tfstate/
+terraform/envs/prod/.terraform.lock.hcl
+jobs_db.json

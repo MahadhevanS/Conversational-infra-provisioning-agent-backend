@@ -48,7 +48,7 @@ variable "rds_instance_type" {
 # S3
 variable "s3_bucket_name" {
   type    = string
-  default = "my-demo-bucket-12345"
+  default = "my-demo-bucket-34rd3fve-2026"
 }
 
 variable "s3_versioning" {
