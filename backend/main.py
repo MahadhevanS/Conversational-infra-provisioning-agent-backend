@@ -5,26 +5,28 @@ import threading
 import time
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from orchestrator import terraform_plan, terraform_apply, terraform_destroy
-from lex import lex_webhook
+
+from .orchestrator import terraform_plan, terraform_apply, infracost_run, run_status, run_result
+from .lex import lex_webhook
 
 app = FastAPI()
 
-# --- PERSISTENCE SETUP ---
-# Store job metadata in a JSON file so it survives server restarts
-DB_FILE = "jobs_db.json"
+# -------------------------------
+# PERSISTENCE (survive restart)
+# -------------------------------
+DB_FILE = os.path.join(os.path.dirname(__file__), "..", "jobs_db.json")
+DB_FILE = os.path.abspath(DB_FILE)
 
 def load_db():
     if not os.path.exists(DB_FILE):
         return {}
-    with open(DB_FILE, "r") as f:
+    with open(DB_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def save_db(data):
-    with open(DB_FILE, "w") as f:
+    with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
 
-# Load existing jobs on startup
 jobs = load_db()
 
 app.add_middleware(
@@ -34,148 +36,149 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- WORKERS WITH PERSISTENCE ---
+# -------------------------------
+# JOB HELPERS
+# -------------------------------
+def create_job(job_type: str, run_id: str, extra: dict | None = None):
+    job_id = f"{job_type.lower()}-{uuid.uuid4()}"
+    jobs[job_id] = {
+        "status": "PENDING",
+        "type": job_type,
+        "run_id": run_id,
+        "created_at": time.time(),
+        **(extra or {})
+    }
+    save_db(jobs)
+    return job_id
 
-def update_job_status(job_id, status, result=None):
-    """Updates the 'database' and saves to disk."""
-    if job_id in jobs:
-        jobs[job_id]["status"] = status
-        if result is not None:
-            jobs[job_id]["result"] = result
-        save_db(jobs)
+def update_job_status(job_id: str, status: str, error: str | None = None):
+    if job_id not in jobs:
+        return
+    jobs[job_id]["status"] = status
+    if error:
+        jobs[job_id]["error"] = error
+    save_db(jobs)
 
-def run_plan_worker(job_id, blueprint, env):
+# -------------------------------
+# WORKERS
+# -------------------------------
+def run_plan_worker(job_id: str, blueprint: dict, run_id: str):
     try:
         update_job_status(job_id, "RUNNING")
-        # The orchestrator handles the heavy lifting in a unique folder
-        result = terraform_plan(blueprint, job_id)
-        
-        if "error" in result:
-            update_job_status(job_id, "FAILED", result["error"])
-        else:
-            update_job_status(job_id, "COMPLETED", result["structured_plan"])
+        terraform_plan(blueprint, run_id)  # plan runs in background inside orchestrator
+        update_job_status(job_id, "RUNNING")
     except Exception as e:
         update_job_status(job_id, "FAILED", str(e))
 
-# def run_apply_worker(job_id, plan_job_id, blueprint):
-#     try:
-#         update_job_status(job_id, "RUNNING")
-#         # Apply specifically looks for the 'tfplan' file in the plan_job_id folder
-#         result = terraform_apply(plan_job_id, blueprint)
-        
-#         if "error" in result:
-#             update_job_status(job_id, "FAILED", result["error"])
-#         else:
-#             update_job_status(job_id, "COMPLETED", result["outputs"])
-#     except Exception as e:
-#         update_job_status(job_id, "FAILED", str(e))
-
-def run_apply_worker(job_id, plan_job_id, blueprint):
+def run_cost_worker(job_id: str, run_id: str):
     try:
         update_job_status(job_id, "RUNNING")
-
-        result = terraform_apply(plan_job_id, blueprint)
-
-        if "error" in result:
-            update_job_status(job_id, "FAILED", result)
-        else:
-            update_job_status(job_id, "COMPLETED", result)
-
+        infracost_run(run_id)  # cost runs in background inside orchestrator
+        update_job_status(job_id, "RUNNING")
     except Exception as e:
         update_job_status(job_id, "FAILED", str(e))
-                
-# --- ROUTES ---
 
+def run_apply_worker(job_id: str, run_id: str, blueprint: dict):
+    try:
+        update_job_status(job_id, "RUNNING")
+        terraform_apply(run_id, blueprint)  # apply runs in background inside orchestrator
+        update_job_status(job_id, "RUNNING")
+    except Exception as e:
+        update_job_status(job_id, "FAILED", str(e))
+
+# -------------------------------
+# ROUTES
+# -------------------------------
 @app.post("/lex-webhook")
 def handle_lex(event: dict):
     return lex_webhook(event)
 
+# 1) PLAN BUTTON
 @app.post("/plan")
 def plan_infra(payload: dict):
     blueprint = payload.get("infra_blueprint") or payload
-    env = blueprint.get("environment", "dev")
-    job_id = f"plan-{uuid.uuid4()}"
+    run_id = uuid.uuid4().hex[:8]
 
-    jobs[job_id] = {
-        "status": "PENDING",
-        "type": "PLAN",
-        "env": env,
-        "created_at": time.time()
-    }
-    save_db(jobs)
+    job_id = create_job(
+        job_type="PLAN",
+        run_id=run_id,
+        extra={"env": blueprint.get("environment", "development")}
+    )
 
-    threading.Thread(target=run_plan_worker, args=(job_id, blueprint, env)).start()
-    return {"status": "accepted", "job_id": job_id}
+    threading.Thread(target=run_plan_worker, args=(job_id, blueprint, run_id), daemon=True).start()
+    return {"status": "accepted", "job_id": job_id, "run_id": run_id}
 
+# 2) COST BUTTON
+@app.post("/cost")
+def cost_infra(payload: dict):
+    run_id = payload.get("run_id")
+    if not run_id:
+        raise HTTPException(status_code=400, detail="run_id required")
+
+    job_id = create_job(job_type="COST", run_id=run_id)
+    threading.Thread(target=run_cost_worker, args=(job_id, run_id), daemon=True).start()
+    return {"status": "accepted", "job_id": job_id, "run_id": run_id}
+
+# 3) APPLY BUTTON
 @app.post("/apply")
 def apply_infra(payload: dict):
-    plan_job_id = payload.get("job_id")
-    blueprint = payload.get("infra_blueprint")
-    
-    if not plan_job_id:
-        raise HTTPException(status_code=400, detail="Plan Job ID required")
+    run_id = payload.get("run_id")
+    blueprint = payload.get("infra_blueprint") or payload.get("blueprint")
 
-    job_id = f"apply-{uuid.uuid4()}"
-    jobs[job_id] = {
-        "status": "PENDING",
-        "type": "APPLY",
-        "plan_ref": plan_job_id,
-        "created_at": time.time()
-    }
-    save_db(jobs)
+    if not run_id:
+        raise HTTPException(status_code=400, detail="run_id required")
+    if not blueprint:
+        raise HTTPException(status_code=400, detail="infra_blueprint required")
 
-    threading.Thread(target=run_apply_worker, args=(job_id, plan_job_id, blueprint)).start()
-    return {"status": "accepted", "apply_job_id": job_id}
+    job_id = create_job(job_type="APPLY", run_id=run_id)
+    threading.Thread(target=run_apply_worker, args=(job_id, run_id, blueprint), daemon=True).start()
+    return {"status": "accepted", "job_id": job_id, "run_id": run_id}
 
+# 4) STATUS POLL (by job_id)
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
     current_jobs = load_db()
     job = current_jobs.get(job_id)
-
     if not job:
-        return {
-            "job_id": job_id,
-            "status": "NOT_FOUND"
-        }
+        return {"job_id": job_id, "status": "NOT_FOUND"}
 
-    response = {
+    run_id = job.get("run_id")
+
+    resp = {
         "job_id": job_id,
+        "run_id": run_id,
         "status": job.get("status"),
         "type": job.get("type"),
-        "created_at": job.get("created_at")
+        "created_at": job.get("created_at"),
     }
 
-    # If job completed and has result
-    if job.get("status") == "COMPLETED" and "result" in job:
-
-        # PLAN job → extract resources cleanly
-        if job.get("type") == "PLAN":
-            structured_plan = job["result"]
-            resource_changes = structured_plan.get("resource_changes", [])
-
-            resources = []
-
-            for r in resource_changes:
-                resources.append({
-                    "address": r.get("address"),
-                    "type": r.get("type"),
-                    "actions": r.get("change", {}).get("actions", [])
-                })
-
-            response["resources"] = resources
-
-            # 🔥 IMPORTANT: also return full plan
-            response["structured_plan"] = structured_plan
-
-        # APPLY job → return outputs
-        elif job.get("type") == "APPLY":
-            result = job["result"]
-
-            response["outputs"] = result.get("outputs", {})
-            response["access"] = result.get("access", [])
-
-    # If failed
+    # if worker itself failed
     if job.get("status") == "FAILED":
-        response["error"] = job.get("result")
+        resp["error"] = job.get("error")
+        return resp
 
-    return response
+    # Poll runtime status
+    if run_id:
+        step_status = run_status(run_id)
+        resp["step_status"] = step_status
+
+        s = (step_status.get("status") or "").upper()
+
+        if s in ["PLAN_DONE", "COST_DONE", "APPLY_DONE"]:
+            current_jobs[job_id]["status"] = "COMPLETED"
+            save_db(current_jobs)
+            resp["status"] = "COMPLETED"
+
+        if s in ["PLAN_FAILED", "COST_FAILED", "APPLY_FAILED", "PLAN_BLOCKED"]:
+            current_jobs[job_id]["status"] = "FAILED"
+            current_jobs[job_id]["error"] = step_status.get("message")
+            save_db(current_jobs)
+            resp["status"] = "FAILED"
+            resp["error"] = current_jobs[job_id]["error"]
+
+    return resp
+
+# 5) RESULT (optional)
+@app.get("/result/{run_id}")
+def get_result(run_id: str):
+    return run_result(run_id)

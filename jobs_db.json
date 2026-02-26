@@ -1,0 +1,21 @@
+{
+    "plan-0064b557-b922-432b-b428-be49a2d14295": {
+        "status": "RUNNING",
+        "type": "PLAN",
+        "run_id": "8a94b8b9",
+        "created_at": 1772098168.8023975,
+        "env": "dev"
+    },
+    "cost-4a9d0bca-4483-4809-a6e2-b218a8000538": {
+        "status": "RUNNING",
+        "type": "COST",
+        "run_id": "8a94b8b9",
+        "created_at": 1772098325.8573935
+    },
+    "cost-795bf7d6-9eef-4438-825a-715b9b7b6bf1": {
+        "status": "RUNNING",
+        "type": "COST",
+        "run_id": "8a94b8b9",
+        "created_at": 1772098373.2120097
+    }
+}
