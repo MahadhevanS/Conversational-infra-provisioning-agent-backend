@@ -395,7 +395,13 @@ def lex_webhook(event):
     if state == STATE_WAITING_PLAN_CONFIRM:
         if is_yes:
             bp = json.loads(attrs["infra_blueprint"])
-            result, error = call_backend(BACK_PLAN_URL, {"infra_blueprint": bp})
+            result, error = call_backend(
+                            BACK_PLAN_URL, 
+                            {
+                                "project_id": attrs.get("project_id"),
+                                "infra_blueprint": bp
+                            }
+            )
 
             if error:
                 return build_response(
@@ -430,6 +436,9 @@ def lex_webhook(event):
     # =====================================================
 
     if intent_name == "CreateInfraIntent":
+        if "project_id" not in attrs:
+            attrs["project_id"] = str(uuid.uuid4())
+            
         app_type = parse_application_intent(text)
         env = parse_environment(text) or DEFAULT_ENV
         

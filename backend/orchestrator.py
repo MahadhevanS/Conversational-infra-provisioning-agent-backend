@@ -4,10 +4,11 @@ import json
 import shutil
 import platform
 import threading
-from tfvars_generator import generate_tfvars
-from terraform.executor import TerraformExecutor
+from backend.tfvars_generator import generate_tfvars
+from backend.terraform.executor import TerraformExecutor
+import boto3
 
-# --- PATHS ---
+# --- PATHS --- 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JOBS_BASE_DIR = os.path.join(PROJECT_ROOT, "persistent_jobs")
 os.makedirs(JOBS_BASE_DIR, exist_ok=True)
@@ -15,26 +16,75 @@ os.makedirs(JOBS_BASE_DIR, exist_ok=True)
 # --- GLOBAL LOCKS ---
 ENV_LOCKS = {}
 
-def get_env_lock(env_name):
-    if env_name not in ENV_LOCKS:
-        ENV_LOCKS[env_name] = threading.Lock()
-    return ENV_LOCKS[env_name]
+ENV_MAP = {
+    "production": "prod",
+    "prod": "prod",
+    "development": "dev",
+    "dev": "dev"
+}
+
+def get_env_lock(project_id, env_name):
+    key = f"{project_id}-{env_name}"
+    if key not in ENV_LOCKS:
+        ENV_LOCKS[key] = threading.Lock()
+    return ENV_LOCKS[key]
 
 # --- HELPERS ---
-def get_workspace_path(job_id, env_name):
-    """Utility to map job IDs to specific file system locations."""
-    env_folder = "prod" if "prod" in env_name.lower() else "dev"
-    return os.path.join(JOBS_BASE_DIR, job_id, "terraform", "envs", env_folder)
+def assume_role(role_arn, external_id=None):
+    sts = boto3.client(
+        "sts",
+        region_name="us-east-1"  # or from blueprint
+    )
 
-def find_latest_state(env_name):
-    """Searches past jobs to find the most recent terraform.tfstate."""
+    assume_params = {
+        "RoleArn": role_arn,
+        "RoleSessionName": "CloudCrafterSession"
+    }
+
+    if external_id:
+        assume_params["ExternalId"] = external_id
+
+    response = sts.assume_role(**assume_params)
+
+    creds = response["Credentials"]
+
+    return {
+        "AWS_ACCESS_KEY_ID": creds["AccessKeyId"],
+        "AWS_SECRET_ACCESS_KEY": creds["SecretAccessKey"],
+        "AWS_SESSION_TOKEN": creds["SessionToken"]
+    }
+
+def get_workspace_path(project_id, job_id, env_name):
     env_folder = "prod" if "prod" in env_name.lower() else "dev"
-    job_ids = sorted(os.listdir(JOBS_BASE_DIR), reverse=True) # Newest first
-    
+    return os.path.join(JOBS_BASE_DIR, project_id, job_id, "terraform", "envs", env_folder)
+
+def find_latest_state(project_id, env_name):
+    env_folder = "prod" if "prod" in env_name.lower() else "dev"
+
+    project_path = os.path.join(JOBS_BASE_DIR, project_id)
+
+    if not os.path.exists(project_path):
+        return None
+
+    job_ids = sorted(
+        os.listdir(project_path),
+        key=lambda x: os.path.getctime(os.path.join(project_path, x)),
+        reverse=True
+    )
+
     for job_id in job_ids:
-        state_path = os.path.join(JOBS_BASE_DIR, job_id, "terraform", "envs", env_folder, "terraform.tfstate")
+        state_path = os.path.join(
+            project_path,
+            job_id,
+            "terraform",
+            "envs",
+            env_folder,
+            "terraform.tfstate"
+        )
+
         if os.path.exists(state_path):
             return state_path
+
     return None
 
 def format_access_points(outputs):
@@ -68,10 +118,10 @@ def format_access_points(outputs):
 
 # --- CORE LOGIC ---
 
-def terraform_plan(blueprint, job_id):
+def terraform_plan(project_id, blueprint, job_id, credentials):
     try:
         env = blueprint.get("environment", "development").lower()
-        workspace_path = get_workspace_path(job_id, env)
+        workspace_path = get_workspace_path(project_id, job_id, env)
         
         # 1. Prepare Directory Structure
         os.makedirs(workspace_path, exist_ok=True)
@@ -87,13 +137,19 @@ def terraform_plan(blueprint, job_id):
                 shutil.copy2(s, d)
 
         # 2. Inject Latest State (Crucial for Modify/Terminate)
-        latest_state = find_latest_state(env)
+        latest_state = find_latest_state(project_id, env)
         if latest_state:
             shutil.copy2(latest_state, os.path.join(workspace_path, "terraform.tfstate"))
 
         # 3. Handle Modules (Symlink)
         modules_src = os.path.join(PROJECT_ROOT, "terraform", "modules")
-        modules_dst = os.path.join(JOBS_BASE_DIR, job_id, "terraform", "modules")
+        modules_dst = os.path.join(
+            JOBS_BASE_DIR,
+            project_id,
+            job_id,
+            "terraform",
+            "modules"
+        )
         os.makedirs(os.path.dirname(modules_dst), exist_ok=True)
         
         if not os.path.exists(modules_dst):
@@ -102,18 +158,27 @@ def terraform_plan(blueprint, job_id):
             else:
                 os.symlink(modules_src, modules_dst)
 
+        aws_env = os.environ.copy()
+
+        if credentials:
+            temp_creds = assume_role(
+                credentials["role_arn"],
+                credentials.get("external_id")
+            )
+            aws_env.update(temp_creds)
+
         # 4. Execute Plan with Locking
-        with get_env_lock(env):
+        with get_env_lock(project_id, env):
             tfvars_path = generate_tfvars(blueprint, workspace_path)
             
             # Init
             subprocess.run(["terraform", "init", "-no-color", "-input=false"], 
-                           cwd=workspace_path, capture_output=True, check=True)
+                           cwd=workspace_path, env=aws_env, capture_output=True, check=True)
             
             # Plan
             plan_proc = subprocess.run(
                 ["terraform", "plan", f"-var-file={tfvars_path}", "-out=tfplan", "-no-color"],
-                cwd=workspace_path, capture_output=True, text=True
+                cwd=workspace_path, env=aws_env, capture_output=True, text=True
             )
             
             if plan_proc.returncode != 0:
@@ -121,7 +186,7 @@ def terraform_plan(blueprint, job_id):
 
             # Show Structured JSON
             show_json = subprocess.run(["terraform", "show", "-json", "tfplan"], 
-                                       cwd=workspace_path, capture_output=True, text=True)
+                                       cwd=workspace_path, env=aws_env, capture_output=True, text=True)
             
             structured_plan = json.loads(show_json.stdout) if show_json.returncode == 0 else {}
             plan_json_path = os.path.join(workspace_path, "plan.json")
@@ -137,15 +202,23 @@ def terraform_plan(blueprint, job_id):
         return {"error": f"Orchestrator Plan Error: {str(e)}"}
 
     
-def terraform_apply(plan_job_id, blueprint):
+def terraform_apply(project_id, plan_job_id, blueprint, credentials=None):
     try:
         env = blueprint.get("environment", "development").lower()
-        workspace_path = get_workspace_path(plan_job_id, env)
+        workspace_path = get_workspace_path(project_id, plan_job_id, env)
 
         if not os.path.exists(os.path.join(workspace_path, "tfplan")):
             return {"error": "Binary plan file 'tfplan' not found in workspace."}
+        
+        aws_env = os.environ.copy()
+        if credentials:
+            temp_creds = assume_role(
+                credentials["role_arn"],
+                credentials.get("external_id")
+            )
+            aws_env.update(temp_creds)
 
-        with get_env_lock(env):
+        with get_env_lock(project_id, env):
 
             executor = TerraformExecutor(workspace_path)
             apply_result = executor.safe_apply()
@@ -171,6 +244,7 @@ def terraform_apply(plan_job_id, blueprint):
                 state_proc = subprocess.run(
                     ["terraform", "state", "list"],
                     cwd=workspace_path,
+                    env=aws_env,
                     capture_output=True,
                     text=True
                 )
@@ -194,6 +268,7 @@ def terraform_apply(plan_job_id, blueprint):
             out_proc = subprocess.run(
                 ["terraform", "output", "-json"],
                 cwd=workspace_path,
+                env=aws_env,
                 capture_output=True,
                 text=True
             )
@@ -214,10 +289,10 @@ def terraform_apply(plan_job_id, blueprint):
 # COST ESTIMATION
 # =====================================================
 
-def terraform_cost(plan_job_id, blueprint):
+def terraform_cost(project_id,plan_job_id, blueprint, credentials=None):
     try:
         env = blueprint.get("environment", "development").lower()
-        workspace_path = get_workspace_path(plan_job_id, env)
+        workspace_path = get_workspace_path(project_id, plan_job_id, env)
 
         plan_json_path = os.path.join(workspace_path, "plan.json")
 
@@ -225,7 +300,15 @@ def terraform_cost(plan_job_id, blueprint):
         if not os.path.exists(plan_json_path):
             return {"error": "plan.json not found. Run plan first."}
 
-        with get_env_lock(env):
+        aws_env = os.environ.copy()
+        if credentials:
+            temp_creds = assume_role(
+                credentials["role_arn"],
+                credentials.get("external_id")
+            )
+            aws_env.update(temp_creds)
+
+        with get_env_lock(project_id, env):
 
             # Run Infracost breakdown
             cost_proc = subprocess.run(
@@ -236,6 +319,7 @@ def terraform_cost(plan_job_id, blueprint):
                     "--format", "json"
                 ],
                 cwd=workspace_path,
+                env=aws_env,
                 capture_output=True,
                 text=True
             )
@@ -268,16 +352,26 @@ def terraform_cost(plan_job_id, blueprint):
 # DESTROY
 # =====================================================
 
-def terraform_destroy(blueprint):
-
+def terraform_destroy(project_id, blueprint, credentials=None):   
     try:
         env = blueprint.get("environment", "development").lower()
         env_folder = ENV_MAP.get(env, "dev")
 
+        project_path = os.path.join(JOBS_BASE_DIR, project_id)
+
+        aws_env = os.environ.copy()
+        if credentials:
+            temp_creds = assume_role(
+                credentials["role_arn"],
+                credentials.get("external_id")
+            )
+            aws_env.update(temp_creds)
+
         # Find latest workspace for this environment
-        for job_id in os.listdir(JOBS_BASE_DIR):
+        for job_id in os.listdir(project_path):
             candidate = os.path.join(
                 JOBS_BASE_DIR,
+                project_id,
                 job_id,
                 "terraform",
                 "envs",
@@ -289,13 +383,14 @@ def terraform_destroy(blueprint):
         else:
             return {"error": "No deployed environment found."}
 
-        lock = get_env_lock(env)
+        lock = get_env_lock(project_id, env)
 
         with lock:
 
             destroy_proc = subprocess.run(
                 ["terraform", "destroy", "-auto-approve", "-no-color"],
                 cwd=workspace_path,
+                env=aws_env,
                 capture_output=True,
                 text=True
             )
@@ -312,19 +407,25 @@ def terraform_destroy(blueprint):
 # STATUS
 # =====================================================
 
-def terraform_status(environment):
+def terraform_status(project_id, environment):
 
     env = environment.lower()
     env_folder = ENV_MAP.get(env, "dev")
 
-    for job_id in os.listdir(JOBS_BASE_DIR):
+    project_path = os.path.join(JOBS_BASE_DIR, project_id)
+
+    if not os.path.exists(project_path):
+        return {"status": "NOT_DEPLOYED"}
+
+    for job_id in os.listdir(project_path):
         candidate = os.path.join(
             JOBS_BASE_DIR,
+            project_id,
             job_id,
             "terraform",
             "envs",
             env_folder
-        )
+        )   
         if os.path.exists(candidate):
             workspace_path = candidate
             break

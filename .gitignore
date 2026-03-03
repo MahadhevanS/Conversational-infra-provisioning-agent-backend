@@ -6,4 +6,5 @@ terraform/envs/dev/.terraform.lock.hcl
 terraform/envs/dev/terraform.tfstate.backup/
 terraform/envs/dev/terraform.tfstate/
 terraform/envs/prod/.terraform.lock.hcl
-jobs_db.json
+backend/jobs_db.json
+.env

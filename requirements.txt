@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+supabase
+python-dotenv
+requests
+boto3
+python-jose
