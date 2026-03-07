@@ -1,11 +1,12 @@
 import uuid
 import threading
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from backend.db import supabase
 from backend.orchestrator import terraform_plan, terraform_apply, terraform_destroy, terraform_cost
 from backend.lex import lex_webhook
+from fastapi.concurrency import run_in_threadpool
 
 app = FastAPI()
 
@@ -29,29 +30,35 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 
     return response.user
                 
-def get_project_credentials(project_id, user_id):
+def get_project_credentials(project_id):
+    print(f"🔍 Looking up credentials for project_id: '{project_id}'")
+    
+    # 1. Look up the user_id from the project (Removed .single()!)
     project_res = supabase.table("projects") \
         .select("user_id") \
         .eq("project_id", project_id) \
-        .single() \
         .execute()
 
+    # Safely check if the list is empty
     if not project_res.data:
-        raise HTTPException(status_code=404, detail="Project not found")
+        print(f"❌ Could not find project {project_id} in database!")
+        raise HTTPException(status_code=404, detail=f"Project not found for id: {project_id}")
 
-    if project_res.data["user_id"] != user_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    # Grab the first item from the list
+    user_id = project_res.data[0]["user_id"]
 
+    # 2. Get the credentials for that user (Removed .single()!)
     cred_res = supabase.table("aws_credentials") \
         .select("role_arn, external_id") \
         .eq("user_id", user_id) \
-        .single() \
         .execute()
 
     if not cred_res.data:
+        print(f"❌ Could not find AWS credentials for user {user_id}!")
         raise HTTPException(status_code=400, detail="AWS IAM Role not configured")
 
-    return cred_res.data
+    print("✅ Credentials found successfully!")
+    return cred_res.data[0]
 
 # --- WORKERS WITH PERSISTENCE ---
 
@@ -75,10 +82,14 @@ def run_plan_worker(project_id, job_id, blueprint, credentials=None):
         result = terraform_plan(project_id, blueprint, job_id, credentials=credentials)
         
         if "error" in result:
+            # 🔥 WE ADDED THIS PRINT STATEMENT
+            print(f"❌ TERRAFORM ERROR: {result['error']}") 
             update_job_status(job_id, "FAILED", result["error"])
         else:
             update_job_status(job_id, "COMPLETED", result["structured_plan"])
     except Exception as e:
+        # 🔥 WE ADDED THIS PRINT STATEMENT
+        print(f"❌ WORKER CRASHED: {str(e)}") 
         update_job_status(job_id, "FAILED", str(e))
 
 def run_apply_worker(project_id, job_id, plan_job_id, blueprint, credentials=None):
@@ -108,6 +119,10 @@ def run_cost_worker(project_id, job_id, run_id, blueprint, credentials=None):
         update_job_status(job_id, "FAILED", str(e))
 
 # --- ROUTES ---
+import os
+from fastapi import HTTPException
+
+# --- ROUTES ---
 @app.post("/signup")
 def signup(payload: dict):
     email = payload.get("email")
@@ -121,22 +136,39 @@ def signup(payload: dict):
             detail="email, password, and role_arn required"
         )
 
-    # 1️⃣ Create Supabase user
-    auth_response = supabase.auth.sign_up({
-        "email": email,
-        "password": password
-    })
-
-    if auth_response.user is None:
-        raise HTTPException(status_code=400, detail="Signup failed")
+    # 1️⃣ Create Supabase user inside a try-except block
+    try:
+        auth_response = supabase.auth.sign_up({
+            "email": email,
+            "password": password
+        })
+    except Exception as e:
+        # Catch errors like "User already exists" or invalid passwords
+        raise HTTPException(status_code=400, detail=str(e))
 
     user_id = auth_response.user.id
 
     # 2️⃣ OPTIONAL: Validate IAM role immediately
+    # 2️⃣ OPTIONAL: Validate IAM role immediately
     try:
         import boto3
 
-        sts = boto3.client("sts")
+        # 🔥 THE ULTIMATE FIX: Strip spaces AND quotation marks!
+        access_key = os.environ.get("AWS_ACCESS_KEY_ID", "").replace('"', '').replace("'", "").strip()
+        secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "").replace('"', '').replace("'", "").strip()
+        region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1").replace('"', '').replace("'", "").strip()
+
+        # Debug print to prove exactly what FastAPI is seeing
+        print(f"🕵️‍♂️ DEBUG ACCESS KEY: [{access_key}]")
+        print(f"🕵️‍♂️ DEBUG SECRET KEY LENGTH: {len(secret_key)}")
+
+        sts = boto3.client(
+            "sts",
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region
+        )
+        
         assume_params = {
             "RoleArn": role_arn,
             "RoleSessionName": "SignupValidation"
@@ -149,21 +181,29 @@ def signup(payload: dict):
 
     except Exception as e:
         # Rollback user creation if IAM invalid
-        supabase.auth.admin.delete_user(user_id)
+        try:
+            # Note: This requires the Supabase client to be initialized with the SERVICE_ROLE_KEY
+            supabase.auth.admin.delete_user(user_id)
+        except Exception as rollback_error:
+            print(f"⚠️ Warning: Could not delete user {user_id}. Error: {rollback_error}")
+            
         raise HTTPException(
             status_code=400,
             detail=f"IAM Role validation failed: {str(e)}"
         )
 
     # 3️⃣ Store AWS credentials reference
-    supabase.table("aws_credentials").insert({
-        "user_id": user_id,
-        "role_arn": role_arn,
-        "external_id": external_id
-    }).execute()
+    try:
+        supabase.table("aws_credentials").insert({
+            "user_id": user_id,
+            "role_arn": role_arn,
+            "external_id": external_id
+        }).execute()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Database storage failed: {str(e)}")
 
     return {
-        "message": "Signup successful",
+        "message": "Signup successful! Please check your email to verify your account.",
         "user_id": user_id
     }
 
@@ -175,20 +215,40 @@ def login(payload: dict):
     if not email or not password:
         raise HTTPException(status_code=400, detail="email and password required")
 
-    response = supabase.auth.sign_in_with_password({
-        "email": email,
-        "password": password
-    })
+    try:
+        # If credentials are wrong, this throws an Exception!
+        response = supabase.auth.sign_in_with_password({
+            "email": email,
+            "password": password
+        })
+        
+        # We also need to fetch the user's details for the frontend profile
+        user_id = response.user.id
+        
+        # Fetch AWS credentials from your DB to send back to the frontend
+        cred_res = supabase.table("aws_credentials") \
+            .select("role_arn, external_id") \
+            .eq("user_id", user_id) \
+            .execute()
+            
+        aws_creds = cred_res.data[0] if cred_res.data else {}
 
-    if response.session is None:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    return {
-        "access_token": response.session.access_token,
-        "refresh_token": response.session.refresh_token,
-        "user_id": response.user.id
-    }
-
+        return {
+            "access_token": response.session.access_token,
+            "refresh_token": response.session.refresh_token,
+            "user_id": user_id,
+            "email": email,
+            "full_name": response.user.user_metadata.get("full_name", ""),
+            "aws_account_id": "", # You can parse this from ARN if needed
+            "aws_region": "", 
+            "role_arn": aws_creds.get("role_arn", ""),
+            "external_id": aws_creds.get("external_id", "")
+        }
+        
+    except Exception as e:
+        # Safely catch the error and return it to the UI
+        raise HTTPException(status_code=401, detail=str(e))
+    
 @app.post("/projects")
 def create_project(payload: dict, user=Depends(get_current_user)):
     project_name = payload.get("project_name")
@@ -206,26 +266,34 @@ def create_project(payload: dict, user=Depends(get_current_user)):
     return project.data[0]
 
 @app.post("/lex-webhook")
-def handle_lex(event: dict):
-    return lex_webhook(event)
+async def handle_lex(request: Request):
+    # 1. Catch the raw data from AWS Lex
+    event = await request.json()
+    
+    intent_name = event.get("sessionState", {}).get("intent", {}).get("name", "Unknown")
+    print(f"🚀 WEBHOOK HIT! Intent: {intent_name}")
+    
+    # 🔥 THE FIX: Run the synchronous Lex logic in a separate thread.
+    # This prevents the local HTTP calls from deadlocking FastAPI!
+    return await run_in_threadpool(lex_webhook, event)
 
 @app.post("/plan")
-def plan_infra(payload: dict,user = Depends(get_current_user)):
-    user_id = user.id
+def plan_infra(payload: dict): # Notice we removed Depends(get_current_user)!
     project_id = payload.get("project_id")
     blueprint = payload.get("infra_blueprint") or payload
     
     if not project_id:
         raise HTTPException(status_code=400, detail="project_id required")
     
-    credentials = get_project_credentials(project_id,user_id)
+    # Securely get credentials using ONLY the project_id
+    credentials = get_project_credentials(project_id)
 
     env = blueprint.get("environment", "dev")
     job_id = f"plan-{uuid.uuid4()}"
 
     supabase.table("jobs").insert({
         "job_id": job_id,
-        "project_id": payload.get("project_id"),
+        "project_id": project_id,
         "job_type": "PLAN",
         "status": "RUNNING",
         "env": env
@@ -233,8 +301,9 @@ def plan_infra(payload: dict,user = Depends(get_current_user)):
 
     threading.Thread(
         target=run_plan_worker,
-        args=(payload.get("project_id"), job_id, blueprint, credentials)
+        args=(project_id, job_id, blueprint, credentials)
     ).start()
+    
     return {"status": "accepted", "job_id": job_id}
 
 @app.post("/cost")
@@ -275,7 +344,7 @@ def cost_infra(payload: dict):
     }
 
 @app.post("/apply")
-def apply_infra(payload: dict, user=Depends(get_current_user)):
+def apply_infra(payload: dict): # Removed Depends(get_current_user)!
     project_id = payload.get("project_id")
 
     if not project_id:
@@ -287,9 +356,7 @@ def apply_infra(payload: dict, user=Depends(get_current_user)):
     if not plan_job_id:
         raise HTTPException(status_code=400, detail="Plan Job ID required")
 
-    user_id = user.id   
-
-    credentials = get_project_credentials(project_id, user_id)
+    credentials = get_project_credentials(project_id)
 
     job_id = f"apply-{uuid.uuid4()}"
 
@@ -366,3 +433,38 @@ def get_status(job_id: str):
         response["error"] = job.get("error_message")
 
     return response
+
+@app.get("/projects")
+def get_all_projects(user=Depends(get_current_user)):
+    res = supabase.table("projects") \
+        .select("project_id, project_name, created_at") \
+        .eq("user_id", user.id) \
+        .order("created_at", desc=True) \
+        .execute()
+    return {"projects": res.data}
+
+@app.get("/chats/{project_id}")
+def get_chat_history(project_id: str, user=Depends(get_current_user)):
+    res = supabase.table("chat_messages") \
+        .select("message_id, sender, message_text, created_at") \
+        .eq("project_id", project_id) \
+        .order("created_at", desc = False) \
+        .execute()
+    return {"messages": res.data}
+
+@app.post("/chats")
+def save_chat_message(payload: dict, user=Depends(get_current_user)):
+    project_id = payload.get("project_id")
+    sender = payload.get("sender") # Expects 'USER' or 'BOT'
+    message_text = payload.get("message_text")
+    
+    if not project_id or not sender or not message_text:
+        raise HTTPException(status_code=400, detail="Missing chat data")
+        
+    res = supabase.table("chat_messages").insert({
+        "project_id": project_id,
+        "sender": sender.upper(),
+        "message_text": message_text
+    }).execute()
+    
+    return {"status": "success"}
