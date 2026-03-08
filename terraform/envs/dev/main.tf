@@ -9,6 +9,8 @@ terraform {
   }
 }
 
+# The provider will automatically pick up AWS_ACCESS_KEY_ID, 
+# AWS_SECRET_ACCESS_KEY, and AWS_SESSION_TOKEN from the Python env.
 provider "aws" {
   region = var.region
 }
@@ -16,7 +18,6 @@ provider "aws" {
 # =====================
 # NETWORK (Always On)
 # =====================
-
 module "network" {
   source = "../../modules/network"
 }
@@ -24,7 +25,6 @@ module "network" {
 # =====================
 # EC2
 # =====================
-
 module "ec2" {
   source = "../../modules/ec2"
   count  = var.enable_ec2 ? 1 : 0
@@ -39,7 +39,6 @@ module "ec2" {
 # =====================
 # RDS
 # =====================
-
 module "rds" {
   source = "../../modules/rds"
   count  = var.enable_rds ? 1 : 0
@@ -50,11 +49,9 @@ module "rds" {
   environment       = var.environment
 }
 
-
 # =====================
 # S3
 # =====================
-
 module "s3" {
   source = "../../modules/s3"
   count  = var.enable_s3 ? 1 : 0
@@ -66,7 +63,6 @@ module "s3" {
 # =====================
 # EKS
 # =====================
-
 module "eks" {
   source = "../../modules/eks"
   count  = var.enable_eks ? 1 : 0

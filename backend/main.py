@@ -445,12 +445,40 @@ def get_all_projects(user=Depends(get_current_user)):
 
 @app.get("/chats/{project_id}")
 def get_chat_history(project_id: str, user=Depends(get_current_user)):
-    res = supabase.table("chat_messages") \
-        .select("message_id, sender, message_text, created_at") \
+    # 1. Fetch Chat Messages
+    messages_res = supabase.table("chat_messages") \
+        .select("message_id, sender, message_text, created_at, job_id") \
         .eq("project_id", project_id) \
-        .order("created_at", desc = False) \
+        .order("created_at", desc=False) \
         .execute()
-    return {"messages": res.data}
+    
+    messages = messages_res.data
+
+    # 2. Fetch all Jobs for the project
+    jobs_res = supabase.table("jobs") \
+        .select("*") \
+        .eq("project_id", project_id) \
+        .execute()
+    
+    jobs_list = jobs_res.data
+    jobs_map = {job["job_id"]: job for job in jobs_list}
+
+    # 🔥 THE COST FIX: Find all Cost jobs and link them to their parent Plan
+    cost_map = {}
+    for job in jobs_list:
+        if job["job_type"] == "COST" and job["status"] == "COMPLETED" and job.get("run_id"):
+            cost_map[job["run_id"]] = job.get("result", {}).get("cost_summary")
+
+    # 3. Merge Job data into Messages
+    for msg in messages:
+        if msg.get("job_id") and msg["job_id"] in jobs_map:
+            msg["job_details"] = jobs_map[msg["job_id"]]
+            
+            # 🔥 Inject the cost summary directly into the Plan details!
+            if msg["job_details"]["job_type"] == "PLAN" and msg["job_id"] in cost_map:
+                msg["job_details"]["cost_summary"] = cost_map[msg["job_id"]]
+
+    return {"messages": messages}
 
 @app.post("/chats")
 def save_chat_message(payload: dict, user=Depends(get_current_user)):
@@ -458,13 +486,29 @@ def save_chat_message(payload: dict, user=Depends(get_current_user)):
     sender = payload.get("sender") # Expects 'USER' or 'BOT'
     message_text = payload.get("message_text")
     
+    # 🔥 1. Catch the job_id sent by React
+    job_id = payload.get("job_id") 
+    
     if not project_id or not sender or not message_text:
         raise HTTPException(status_code=400, detail="Missing chat data")
         
-    res = supabase.table("chat_messages").insert({
+    # 🔥 2. Build the insert payload dynamically
+    insert_data = {
         "project_id": project_id,
         "sender": sender.upper(),
         "message_text": message_text
-    }).execute()
+    }
     
+    # 🔥 3. If this message is attached to a Terraform job, link it!
+    if job_id:
+        insert_data["job_id"] = job_id
+        
+    res = supabase.table("chat_messages").insert(insert_data).execute()
+    
+    return {"status": "success"}
+
+@app.post("/jobs/{job_id}/discard")
+def discard_job(job_id: str):
+    # Update the job status in the database permanently
+    supabase.table("jobs").update({"status": "DISCARDED"}).eq("job_id", job_id).execute()
     return {"status": "success"}

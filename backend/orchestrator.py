@@ -202,88 +202,58 @@ def terraform_plan(project_id, blueprint, job_id, credentials):
         return {"error": f"Orchestrator Plan Error: {str(e)}"}
 
     
+
 def terraform_apply(project_id, plan_job_id, blueprint, credentials=None):
+    """
+    Orchestrates the transition from credentials to execution.
+    """
     try:
-        env = blueprint.get("environment", "development").lower()
-        workspace_path = get_workspace_path(project_id, plan_job_id, env)
+        if not credentials or "role_arn" not in credentials:
+            return {"error": "No AWS Role ARN provided for this project."}
 
-        if not os.path.exists(os.path.join(workspace_path, "tfplan")):
-            return {"error": "Binary plan file 'tfplan' not found in workspace."}
+        # 1. Assume the Role of the Tenant (Multi-tenancy)
+        sts_client = boto3.client('sts')
+        # Use ExternalId if provided by the user during signup
+        assume_params = {
+            "RoleArn": credentials["role_arn"],
+            "RoleSessionName": f"CloudCrafter-Apply-{project_id[:8]}"
+        }
+        if credentials.get("external_id"):
+            assume_params["ExternalId"] = credentials["external_id"]
+
+        assumed_role = sts_client.assume_role(**assume_params)
         
-        aws_env = os.environ.copy()
-        if credentials:
-            temp_creds = assume_role(
-                credentials["role_arn"],
-                credentials.get("external_id")
-            )
-            aws_env.update(temp_creds)
+        # 2. Extract Temporary Security Tokens
+        temp_creds = {
+            "AccessKeyId": assumed_role['Credentials']['AccessKeyId'],
+            "SecretAccessKey": assumed_role['Credentials']['SecretAccessKey'],
+            "SessionToken": assumed_role['Credentials']['SessionToken']
+        }
 
-        with get_env_lock(project_id, env):
+        # 3. 🔥 FIX: Initialize Executor targeting the persistent job directory
+        env = blueprint.get("environment", "development").lower()
+        working_dir = get_workspace_path(project_id, plan_job_id, env)
+        
+        # Safety check
+        if not os.path.exists(working_dir):
+            return {"error": f"Workspace directory not found: {working_dir}"}
 
-            executor = TerraformExecutor(workspace_path)
-            apply_result = executor.safe_apply()
+        executor = TerraformExecutor(
+            working_dir=working_dir, 
+            temp_aws_credentials=temp_creds
+        )
 
-            # -------------------------------------------------
-            # APPLY FAILED
-            # -------------------------------------------------
-            if apply_result.get("status") != "SUCCESS":
-
-                error_logs = apply_result.get("logs", {})
-                stderr_text = error_logs.get("stderr", "")
-
-                failed_resource = None
-                created_resources = []
-
-                # Extract failed resource
-                import re
-                match = re.search(r'with\s+([^\s,]+)', stderr_text)
-                if match:
-                    failed_resource = match.group(1)
-
-                # Get successfully created resources
-                state_proc = subprocess.run(
-                    ["terraform", "state", "list"],
-                    cwd=workspace_path,
-                    env=aws_env,
-                    capture_output=True,
-                    text=True
-                )
-
-                if state_proc.returncode == 0:
-                    created_resources = [
-                        r.strip()
-                        for r in state_proc.stdout.splitlines()
-                        if r.strip()
-                    ]
-
-                return {
-                    "error": stderr_text or "Terraform apply failed.",
-                    "failed_resource": failed_resource,
-                    "created_resources": created_resources
-                }
-
-            # -------------------------------------------------
-            # APPLY SUCCESS
-            # -------------------------------------------------
-            out_proc = subprocess.run(
-                ["terraform", "output", "-json"],
-                cwd=workspace_path,
-                env=aws_env,
-                capture_output=True,
-                text=True
-            )
-
-            outputs = json.loads(out_proc.stdout) if out_proc.returncode == 0 else {}
-            access_info = format_access_points(outputs)
-
-            return {
-                "outputs": outputs,
-                "access": access_info
-            }
+        # 4. Run the Apply
+        result = executor.safe_apply()
+        
+        if result["status"] == "FAILED":
+            return {"error": result["logs"]["stderr"]}
+            
+        return result
 
     except Exception as e:
-        return {"error": f"Orchestrator Apply Error: {str(e)}"}
-
+        print(f"❌ Orchestrator Error: {str(e)}")
+        return {"error": str(e)}
 
 # =====================================================
 # COST ESTIMATION
