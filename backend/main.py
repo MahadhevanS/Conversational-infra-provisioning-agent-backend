@@ -118,6 +118,23 @@ def run_cost_worker(project_id, job_id, run_id, blueprint, credentials=None):
     except Exception as e:
         update_job_status(job_id, "FAILED", str(e))
 
+def run_destroy_worker(project_id, job_id, blueprint, credentials=None):
+    try:
+        update_job_status(job_id, "RUNNING")
+        
+        # 🔥 FIX: Pass the blueprint so the orchestrator knows the environment!
+        result = terraform_destroy(project_id, blueprint, credentials=credentials)
+
+        if "error" in result:
+            update_job_status(job_id, "FAILED", result["error"])
+        else:
+            # result might be {"message": "..."}
+            update_job_status(job_id, "COMPLETED", result)
+
+    except Exception as e:
+        print(f"❌ DESTROY WORKER CRASHED: {str(e)}")
+        update_job_status(job_id, "FAILED", str(e))
+
 # --- ROUTES ---
 import os
 from fastapi import HTTPException
@@ -261,6 +278,51 @@ def create_project(payload: dict, user=Depends(get_current_user)):
         "user_id": user.id,
         "project_name": project_name,
         "environment": environment
+    }).execute()
+
+    return project.data[0]
+
+@app.get("/projects/{project_id}/blueprint")
+def get_blueprint(project_id: str):
+
+    res = supabase.table("projects") \
+        .select("current_blueprint") \
+        .eq("project_id", project_id) \
+        .single() \
+        .execute()
+
+    blueprint = res.data.get("current_blueprint")
+
+    if blueprint is None:
+        return {"blueprint": None}
+
+    return {"blueprint": blueprint}
+
+
+@app.post("/projects/{project_id}/blueprint")
+def save_blueprint(project_id: str, payload: dict):
+
+    blueprint = payload.get("blueprint")
+
+    supabase.table("projects") \
+        .update({"current_blueprint": blueprint}) \
+        .eq("project_id", project_id) \
+        .execute()
+
+    return {"status": "saved"}
+
+@app.post("/projects/auto")
+def auto_create_project(payload: dict):
+
+    user_id = payload.get("user_id")
+
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id required")
+
+    project = supabase.table("projects").insert({
+        "user_id": user_id,
+        "project_name": "Auto Project",
+        "environment": "development"
     }).execute()
 
     return project.data[0]
@@ -419,6 +481,7 @@ def get_status(job_id: str):
 
             # 🔥 IMPORTANT: also return full plan
             response["structured_plan"] = structured_plan
+            response["infra_blueprint"] = job.get("infra_blueprint")
 
         # APPLY job → return outputs
         elif job["job_type"] == "APPLY":
@@ -512,3 +575,34 @@ def discard_job(job_id: str):
     # Update the job status in the database permanently
     supabase.table("jobs").update({"status": "DISCARDED"}).eq("job_id", job_id).execute()
     return {"status": "success"}
+
+@app.post("/destroy")
+def destroy_infra(payload: dict):
+    project_id = payload.get("project_id")
+
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id required")
+
+    # 1. Securely fetch project-specific AWS credentials
+    credentials = get_project_credentials(project_id)
+    blueprint = payload.get("infra_blueprint") or {}
+    # 2. Generate a unique job ID for tracking
+    job_id = f"destroy-{uuid.uuid4()}"
+
+    # 3. Insert the job record into Supabase
+    supabase.table("jobs").insert({
+        "job_id": job_id,
+        "project_id": project_id,
+        "job_type": "DESTROY",
+        "status": "RUNNING",
+        "env": "production" # Or pull from payload if needed
+    }).execute()
+
+    # 4. Spin off the background thread to handle the actual Terraform work
+    threading.Thread(
+        target=run_destroy_worker,
+        args=(project_id, job_id, blueprint, credentials),
+        daemon=True
+    ).start()
+
+    return {"status": "accepted", "job_id": job_id}
