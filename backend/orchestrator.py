@@ -4,8 +4,8 @@ import json
 import shutil
 import platform
 import threading
-from backend.tfvars_generator import generate_tfvars
-from backend.terraform.executor import TerraformExecutor
+from tfvars_generator import generate_tfvars
+from terraform.executor import TerraformExecutor
 import boto3
 
 # --- PATHS --- 
