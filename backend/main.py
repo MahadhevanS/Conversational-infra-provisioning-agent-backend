@@ -13,6 +13,7 @@ from fastapi.concurrency import run_in_threadpool
 from db import supabase
 from orchestrator import terraform_plan, terraform_apply, terraform_destroy, terraform_cost
 from lex import lex_webhook
+from ai_analyser import analyse_failure
 
 app = FastAPI()
 
@@ -184,6 +185,82 @@ def update_job_status(job_id, status, result=None):
     supabase.table("jobs").update(update_data).eq("job_id", job_id).execute()
 
 
+def _fetch_log_chunks(job_id: str) -> list:
+    """Fetch log_chunks from the jobs row — used by the AI analysis thread."""
+    try:
+        res = (
+            supabase.table("jobs")
+            .select("log_chunks")
+            .eq("job_id", job_id)
+            .execute()
+        )
+        if res.data:
+            return res.data[0].get("log_chunks") or []
+    except Exception as e:
+        print(f"⚠️ Could not fetch log_chunks for {job_id}: {e}")
+    return []
+
+
+def _fire_ai_analysis(project_id: str, job_id: str, job_type: str):
+    """
+    Spawn a daemon thread that:
+      1. Calls OpenAI to analyse the failure logs.
+      2. Posts the result as a BOT chat message in the project.
+      3. Attaches the result to the existing failure notification's metadata.
+
+    Fire-and-forget — never blocks the worker that calls it.
+    """
+    def _run():
+        print(f"🤖 AI analysis started for {job_type} job {job_id}")
+
+        log_chunks = _fetch_log_chunks(job_id)
+        analysis = analyse_failure(job_id=job_id, job_type=job_type, log_chunks=log_chunks)
+
+        root_cause = analysis.get("root_cause", "Unknown error")
+        fix_steps = analysis.get("fix_steps", [])
+        category = analysis.get("category", "unknown")
+
+        structured = {
+            "root_cause": root_cause,
+            "fix_steps": fix_steps,
+            "category": category,
+        }
+
+        # ── 1. Persist structured analysis on the job row ─────────────────
+        # Primary data source: /status returns it, loadChatHistory reads it,
+        # DeploymentFailureView renders it. No text parsing needed anywhere.
+        try:
+            supabase.table("jobs").update({
+                "ai_analysis": structured
+            }).eq("job_id", job_id).execute()
+            print(f"✅ AI analysis saved to job row for {job_id}")
+        except Exception as e:
+            print(f"❌ Failed to save AI analysis to job row: {e}")
+
+        # ── 2. Attach analysis to the failure notification metadata ────────
+        try:
+            notif_res = (
+                supabase.table("notifications")
+                .select("id, metadata")
+                .eq("metadata->>job_id", job_id)
+                .eq("type", "ERROR")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if notif_res.data:
+                existing_meta = notif_res.data[0].get("metadata") or {}
+                existing_meta["ai_analysis"] = structured
+                supabase.table("notifications").update({
+                    "metadata": existing_meta
+                }).eq("id", notif_res.data[0]["id"]).execute()
+                print(f"✅ AI analysis attached to notification for job {job_id}")
+        except Exception as e:
+            print(f"❌ Failed to attach AI analysis to notification: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def run_plan_worker(project_id, job_id, blueprint, credentials=None):
     try:
         update_job_status(job_id, "RUNNING")
@@ -197,6 +274,7 @@ def run_plan_worker(project_id, job_id, blueprint, credentials=None):
                 f"PLAN job failed for project {project_id}.", "ERROR",
                 {"job_id": job_id, "job_type": "PLAN"},
             )
+            _fire_ai_analysis(project_id, job_id, "PLAN")
         else:
             update_job_status(job_id, "COMPLETED", result["structured_plan"])
             create_notification_for_project(
@@ -212,6 +290,7 @@ def run_plan_worker(project_id, job_id, blueprint, credentials=None):
             f"PLAN job crashed for project {project_id}.", "ERROR",
             {"job_id": job_id, "job_type": "PLAN"},
         )
+        _fire_ai_analysis(project_id, job_id, "PLAN")
 
 
 def run_apply_worker(project_id, job_id, plan_job_id, blueprint, credentials=None):
@@ -240,6 +319,7 @@ def run_apply_worker(project_id, job_id, plan_job_id, blueprint, credentials=Non
                 f"Infrastructure deployment failed for project {project_id}.", "ERROR",
                 {"job_id": job_id, "job_type": "APPLY", "plan_job_id": plan_job_id},
             )
+            _fire_ai_analysis(project_id, job_id, "APPLY")
         else:
             update_job_status(job_id, "COMPLETED", result)
             create_notification_for_project(
@@ -255,6 +335,7 @@ def run_apply_worker(project_id, job_id, plan_job_id, blueprint, credentials=Non
             f"Infrastructure deployment crashed for project {project_id}.", "ERROR",
             {"job_id": job_id, "job_type": "APPLY", "plan_job_id": plan_job_id},
         )
+        _fire_ai_analysis(project_id, job_id, "APPLY")
 
 
 def run_cost_worker(project_id, job_id, run_id, blueprint, credentials=None):
@@ -307,6 +388,7 @@ def run_destroy_worker(project_id, job_id, blueprint, credentials=None):
                 f"Infrastructure destruction failed for project {project_id}.", "ERROR",
                 {"job_id": job_id, "job_type": "DESTROY"},
             )
+            _fire_ai_analysis(project_id, job_id, "DESTROY")
             print(f"❌ Destroy failed notification sent for job_id={job_id}")
         else:
             update_job_status(job_id, "COMPLETED", result)
@@ -325,6 +407,7 @@ def run_destroy_worker(project_id, job_id, blueprint, credentials=None):
             f"Destroy process crashed for project {project_id}.", "ERROR",
             {"job_id": job_id, "job_type": "DESTROY"},
         )
+        _fire_ai_analysis(project_id, job_id, "DESTROY")
 
 
 # --- NOTIFICATION MODELS ---
@@ -856,6 +939,10 @@ def get_status(task_id: str):
 
         if job["status"] == "FAILED":
             response["error"] = job.get("error_message")
+            # Include AI analysis when available so frontend can render it
+            # directly in DeploymentFailureView without a separate fetch
+            if job.get("ai_analysis"):
+                response["ai_analysis"] = job["ai_analysis"]
 
         return response
 
