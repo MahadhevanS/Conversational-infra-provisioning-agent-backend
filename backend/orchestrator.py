@@ -4,8 +4,8 @@ import json
 import shutil
 import platform
 import threading
-from tfvars_generator import generate_tfvars
-from terraform.executor import TerraformExecutor
+from backend.tfvars_generator import generate_tfvars
+from backend.terraform.executor import TerraformExecutor
 import boto3
 
 # --- PATHS ---
@@ -46,7 +46,7 @@ def get_env_lock(project_id, env_name):
 # =========================================================
 
 # Import supabase only for log flushing — avoids circular imports
-from db import supabase as _supabase
+from backend.db import supabase as _supabase
 
 # In-memory accumulator: { job_id: [ {stage, stream, text} ] }
 _log_state: dict[str, list[dict]] = {}
@@ -321,7 +321,7 @@ class TerraformExecutorWithLogs:
         }
 
     def safe_apply(self):
-        from terraform.plan_parser import is_plan_safe
+        from backend.terraform.plan_parser import is_plan_safe
 
         init = self.run(["terraform", "init", "-no-color", "-input=false"])
         if init["exit_code"] != 0:

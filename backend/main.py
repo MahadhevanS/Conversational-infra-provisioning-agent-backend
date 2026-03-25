@@ -2,18 +2,22 @@ import uuid
 import threading
 import os
 import time
+import boto3
 from typing import Optional, Dict, Any
+import traceback
 
 from pydantic import BaseModel
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 
-from db import supabase
-from orchestrator import terraform_plan, terraform_apply, terraform_destroy, terraform_cost
-from lex import lex_webhook
-from ai_analyser import analyse_failure
+from backend.db import supabase
+from backend.orchestrator import terraform_plan, terraform_apply, terraform_destroy, terraform_cost
+from backend.lex import lex_webhook
+from backend.ai_analyser import analyse_failure
+
+from backend.email_service import send_invitation_email
 
 app = FastAPI()
 
@@ -46,6 +50,11 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         except HTTPException:
             raise
         except Exception as e:
+            error_msg = str(e).lower()
+            # 🔥 FIX: If the token is expired, instantly throw a 401 so React logs them out!
+            if "expired" in error_msg or "invalid jwt" in error_msg:
+                raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
+            
             last_error = e
             print(f"⚠️ get_current_user attempt {attempt + 1} failed: {e}")
             time.sleep(0.3)
@@ -614,6 +623,11 @@ def signup(payload: dict):
     role_arn = payload.get("role_arn")
     external_id = payload.get("external_id")
     full_name = payload.get("full_name", "")
+    
+    # 🔥 RBAC: Get the role from the frontend, default to 'admin' if empty
+    requested_role = payload.get("role", "admin")
+    if requested_role not in ["admin", "cloud_architect"]:
+        requested_role = "admin"
 
     if not email or not password or not role_arn:
         raise HTTPException(status_code=400, detail="email, password, and role_arn required")
@@ -630,7 +644,6 @@ def signup(payload: dict):
     user_id = auth_response.user.id
 
     try:
-        import boto3
         access_key = os.environ.get("AWS_ACCESS_KEY_ID", "").replace('"', "").replace("'", "").strip()
         secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "").replace('"', "").replace("'", "").strip()
         region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1").replace('"', "").replace("'", "").strip()
@@ -650,11 +663,21 @@ def signup(payload: dict):
         raise HTTPException(status_code=400, detail=f"IAM Role validation failed: {str(e)}")
 
     try:
+        # Save AWS Credentials
         supabase.table("aws_credentials").insert({
             "user_id": user_id,
             "role_arn": role_arn,
             "external_id": external_id,
         }).execute()
+        
+        # 🔥 RBAC: Save the user's role to the new profiles table!
+        supabase.table("user_profiles").insert({
+            "user_id": user_id,
+            "email": email,
+            "full_name": full_name,
+            "role": requested_role
+        }).execute()
+        
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Database storage failed: {str(e)}")
 
@@ -663,56 +686,352 @@ def signup(payload: dict):
         "user_id": user_id,
     }
 
-
 @app.post("/login")
 def login(payload: dict):
     email = payload.get("email")
     password = payload.get("password")
 
     if not email or not password:
-        raise HTTPException(status_code=400, detail="email and password required")
+        raise HTTPException(status_code=400, detail="Email and password required")
+
+    # 1. Authenticate with Supabase
+    try:
+        auth_response = supabase.auth.sign_in_with_password({
+            "email": email,
+            "password": password,
+        })
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    user_id = auth_response.user.id
+
+    # 2. Role Extraction
+    user_role = ""
+    try:
+        profile_res = supabase.table("user_profiles").select("role").eq("user_id", user_id).execute()
+
+        if hasattr(profile_res, 'data') and isinstance(profile_res.data, list) and len(profile_res.data) > 0:
+            first_row = profile_res.data[0]  # ✅ FIX: added [0]
+            if isinstance(first_row, dict):
+                user_role = first_row.get("role", "")
+
+    except Exception as e:
+        print(f"⚠️ Warning: Profile extraction failed. Error: {e}")
+
+    # 3. AWS Credentials Extraction
+    aws_account_id = ""
+    role_arn = ""
+    external_id = ""
 
     try:
-        response = supabase.auth.sign_in_with_password({"email": email, "password": password})
-        user_id = response.user.id
+        aws_res = supabase.table("aws_credentials").select("*").eq("user_id", user_id).execute()
 
-        cred_res = (
-            supabase.table("aws_credentials")
-            .select("role_arn, external_id")
-            .eq("user_id", user_id)
-            .execute()
-        )
-        aws_creds = cred_res.data[0] if cred_res.data else {}
+        if hasattr(aws_res, 'data') and isinstance(aws_res.data, list) and len(aws_res.data) > 0:
+            first_aws = aws_res.data[0]  # ✅ FIX: added [0]
+            if isinstance(first_aws, dict):
+                role_arn = first_aws.get("role_arn", "")
+                external_id = first_aws.get("external_id", "")
 
+                if role_arn and ":" in role_arn:
+                    arn_parts = role_arn.split(":")
+                    if len(arn_parts) >= 5:
+                        aws_account_id = arn_parts[4]  # ✅ FIX: added [4]
+
+    except Exception as e:
+        print(f"⚠️ Warning: AWS extraction failed. Error: {e}")
+
+    # 4. Return Payload
+    try:
         return {
-            "access_token": response.session.access_token,
-            "refresh_token": response.session.refresh_token,
-            "user_id": user_id,
-            "email": email,
-            "full_name": response.user.user_metadata.get("full_name", ""),
-            "aws_account_id": "",
-            "aws_region": "",
-            "role_arn": aws_creds.get("role_arn", ""),
-            "external_id": aws_creds.get("external_id", ""),
+            "access_token": auth_response.session.access_token,
+            "email": auth_response.user.email,
+            "full_name": auth_response.user.user_metadata.get("full_name", "") if auth_response.user.user_metadata else "",
+            "role": user_role,
+            "aws_account_id": aws_account_id,
+            "aws_region": "us-east-1",
+            "role_arn": role_arn,
+            "external_id": external_id
         }
     except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
+        import traceback
+        print("🚨 CRITICAL ERROR formatting login return payload:")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to format login response data.")
 
 
-@app.post("/projects")
-def create_project(payload: dict, user=Depends(get_current_user)):
+@app.post("/projects/create")  # 🔥 NOTICE THE NEW URL!
+async def create_project_v2(request: Request, payload: dict, background_tasks: BackgroundTasks):
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid token")
+    
+    token = auth_header.replace("Bearer ", "").strip()
+    
+    try:
+        user_res = supabase.auth.get_user(token)
+        admin_id = user_res.user.id
+        admin_email = user_res.user.email
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
     project_name = payload.get("project_name")
     environment = payload.get("environment", "development")
+    invite_emails = payload.get("invite_emails") or []
+
     if not project_name:
-        raise HTTPException(status_code=400, detail="project_name required")
-    project = supabase.table("projects").insert({
-        "user_id": user.id,
-        "project_name": project_name,
-        "environment": environment,
-    }).execute()
-    return project.data[0]
+        raise HTTPException(status_code=400, detail="Project name is required")
 
+    # 1. CREATE PROJECT
+    try:
+        proj_res = supabase.table("projects").insert({
+            "project_name": project_name,
+            "environment": environment,
+            "user_id": admin_id 
+        }).execute()
+        
+        # 100% BULLETPROOF EXTRACTION
+        inserted_data = proj_res.data
+        new_project = {}
+        
+        # Loop through the list to guarantee we find the dictionary
+        for item in inserted_data:
+            if isinstance(item, dict):
+                new_project = item
+                break
+                
+        project_id = new_project.get("project_id") or new_project.get("id")
+        
+        if not project_id:
+            raise ValueError("Could not extract project ID from database response.")
+            
+    except Exception as e:
+        print(f"🚨 Failed to create project: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create project")
 
+    # 2. HANDLE INVITATIONS
+    successful_invites = []
+    
+    if invite_emails:
+        for email in invite_emails:
+            email = email.strip()
+            if not email: continue
+            
+            try:
+                invite_res = supabase.table("project_invitations").insert({
+                    "project_id": project_id,
+                    "email": email,
+                    "invited_by": admin_id,
+                    "status": "pending"
+                }).execute()
+                
+                # Safe extraction for invitations
+                invite_data = invite_res.data
+                invite_token = None
+                for item in invite_data:
+                    if isinstance(item, dict):
+                        invite_token = item.get("token")
+                        break
+
+                if invite_token:
+                    background_tasks.add_task(
+                        send_invitation_email, email, project_name, admin_email, invite_token
+                    )
+                    successful_invites.append(email)
+                    
+            except Exception as e:
+                print(f"⚠️ Invitation failed for {email}: {e}")
+
+    # 3. RETURN DATA
+    return {
+        "project_id": project_id,
+        "project_name": new_project.get("project_name", project_name),
+        "environment": new_project.get("environment", environment),
+        "created_at": new_project.get("created_at"),
+        "invite_status": f"Successfully created. Emailed {len(successful_invites)} invites." if successful_invites else "Successfully created."
+    }
+
+@app.post("/projects/{project_id}/invite")
+async def invite_architect(project_id: str, request: Request, payload: dict, background_tasks: BackgroundTasks):
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid token")
+    
+    token = auth_header.split(" ").strip()
+    
+    try:
+        user_res = supabase.auth.get_user(token)
+        admin_id = user_res.user.id
+        admin_email = user_res.user.email
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+    # SECURITY CHECK
+    proj_res = supabase.table("projects").select("user_id, project_name").eq("project_id", project_id).execute()
+    if not proj_res.data or len(proj_res.data) == 0:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    
+    if proj_res.data.get("user_id") != admin_id:
+        raise HTTPException(status_code=403, detail="Only the project Admin can invite members.")
+
+    project_name = proj_res.data.get("project_name")
+    invite_email = payload.get("email", "").strip()
+    
+    if not invite_email:
+        raise HTTPException(status_code=400, detail="Email is required.")
+
+    try:
+        # Check if they are already in the project
+        profile_res = supabase.table("user_profiles").select("user_id").eq("email", invite_email).execute()
+        
+        if hasattr(profile_res, 'data') and len(profile_res.data) > 0:
+            invited_user_id = profile_res.data.get("user_id")
+            existing_member = supabase.table("project_members").select("id").eq("project_id", project_id).eq("user_id", invited_user_id).execute()
+            
+            if hasattr(existing_member, 'data') and len(existing_member.data) > 0:
+                return {"message": f"{invite_email} is already a member of this project."}
+
+        # Create the Pending Invitation
+        invite_res = supabase.table("project_invitations").insert({
+            "project_id": project_id,
+            "email": invite_email,
+            "invited_by": admin_id,
+            "status": "pending"
+        }).execute()
+        
+        invite_token = invite_res.data.get("token")
+
+        # QUEUE THE EMAIL!
+        background_tasks.add_task(
+            send_invitation_email, 
+            invite_email, 
+            project_name, 
+            admin_email, 
+            invite_token
+        )
+        
+        return {"message": f"Successfully sent an invitation email to {invite_email}."}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"🚨 Invite Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send invitation.")
+
+@app.delete("/projects/{project_id}/members/{email}")
+async def remove_architect(project_id: str, email: str, request: Request):
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+    
+    # 🔥 FIXED: Added.strip()
+    token = auth_header.split(" ").strip()
+    
+    try:
+        user_res = supabase.auth.get_user(token)
+        admin_id = user_res.user.id
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+    # 2. SECURITY CHECK
+    # 🔥 FIXED: Changed "owner_id" to "user_id"
+    proj_res = supabase.table("projects").select("user_id").eq("project_id", project_id).execute()
+    if not proj_res.data or len(proj_res.data) == 0:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    
+    # 🔥 FIXED: Added
+    if proj_res.data.get("user_id") != admin_id:
+        raise HTTPException(status_code=403, detail="Only the project Admin can remove members.")
+
+    try:
+        profile_res = supabase.table("user_profiles").select("user_id").eq("email", email).execute()
+        
+        if not (hasattr(profile_res, 'data') and isinstance(profile_res.data, list) and len(profile_res.data) > 0):
+            raise HTTPException(status_code=404, detail=f"No account found for {email}.")
+            
+        # 🔥 FIXED: Added
+        target_user_id = profile_res.data.get("user_id")
+
+        delete_res = supabase.table("project_members").delete().eq("project_id", project_id).eq("user_id", target_user_id).execute()
+        
+        if not delete_res.data or len(delete_res.data) == 0:
+            return {"message": f"{email} is not a member of this project."}
+
+        return {"message": f"Successfully removed {email} from the project."}
+
+    except HTTPException:
+        raise 
+    except Exception as e:
+        print(f"🚨 Removal Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to remove member.")
+
+@app.post("/invitations/{token}/accept")
+async def accept_invitation(token: str, request: Request):
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or "Bearer " not in auth_header:
+        raise HTTPException(status_code=401, detail="Please log in to accept this invite.")
+    
+    access_token = auth_header.replace("Bearer ", "").strip()
+    
+    try:
+        user_res = supabase.auth.get_user(access_token)
+        architect_id = user_res.user.id
+        architect_email = user_res.user.email
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid session. Please log in again.")
+
+    try:
+        # 1. Fetch the invitation
+        invite_res = supabase.table("project_invitations").select("*").eq("token", token).eq("status", "pending").execute()
+        
+        # 2. 100% BULLETPROOF DICTIONARY EXTRACTION
+        invitation = {}
+        raw_data = invite_res.data
+        
+        if not raw_data or str(raw_data) == "[]":
+             raise HTTPException(status_code=404, detail="Invitation is invalid, expired, or already accepted.")
+
+        # Search through whatever Supabase handed back to find the actual dictionary
+        if isinstance(raw_data, dict):
+            invitation = raw_data
+        elif isinstance(raw_data, list):
+            for item in raw_data:
+                if isinstance(item, dict):
+                    invitation = item
+                    break
+                # Handle double-nested lists just in case
+                elif isinstance(item, list) and len(item) > 0 and isinstance(item, dict):
+                    invitation = item
+                    break
+
+        if not invitation:
+            raise ValueError(f"Could not parse database response. Raw data: {raw_data}")
+
+        # 3. Safe extraction without using .get()
+        inv_email = invitation["email"] if "email" in invitation else ""
+        inv_project_id = invitation["project_id"] if "project_id" in invitation else ""
+        inv_invited_by = invitation["invited_by"] if "invited_by" in invitation else ""
+
+        if architect_email.lower() != inv_email.lower():
+            raise HTTPException(status_code=403, detail="This invite was sent to a different email address.")
+
+        # 4. Move them into the actual project
+        supabase.table("project_members").insert({
+            "project_id": inv_project_id,
+            "user_id": architect_id,
+            "added_by": inv_invited_by
+        }).execute()
+
+        # 5. Mark the invitation as accepted
+        supabase.table("project_invitations").update({"status": "accepted"}).eq("token", token).execute()
+
+        return {"message": "Successfully joined the project!"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"🚨 Accept Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process invitation.")
+    
 @app.post("/lex-webhook")
 async def handle_lex(request: Request):
     event = await request.json()
@@ -978,16 +1297,55 @@ def get_job_logs(job_id: str):
 
 
 @app.get("/projects")
-def get_all_projects(user=Depends(get_current_user)):
-    res = (
-        supabase.table("projects")
-        .select("project_id, project_name, created_at")
-        .eq("user_id", user.id)
-        .order("created_at", desc=True)
-        .execute()
-    )
-    return {"projects": res.data}
+async def get_projects(request: Request):
+    # 1. Authenticate the user
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+    
+    token = auth_header.split(" ")[1]  # ✅ FIX: grab the actual token string
+    
+    try:
+        user_res = supabase.auth.get_user(token)
+        user_id = user_res.user.id
+    except Exception as e:
+        print(f"🚨 SUPABASE REJECTED TOKEN: {e}")
+        raise HTTPException(status_code=401, detail="Invalid session")
 
+    projects_list = []
+    
+    try:
+        # BATCH 1: Fetch projects the user OWNS
+        owned_res = supabase.table("projects").select("*").eq("user_id", user_id).execute()
+        
+        if hasattr(owned_res, 'data') and isinstance(owned_res.data, list):
+            for proj in owned_res.data:
+                proj["access_level"] = "admin"
+                projects_list.append(proj)
+
+        # BATCH 2: Fetch projects the user is INVITED TO
+        member_res = supabase.table("project_members").select("project_id").eq("user_id", user_id).execute()
+        
+        if hasattr(member_res, 'data') and isinstance(member_res.data, list) and len(member_res.data) > 0:
+            invited_project_ids = [m.get("project_id") for m in member_res.data if m.get("project_id")]
+            
+            if invited_project_ids:
+                invited_projects_res = supabase.table("projects").select("*").in_("project_id", invited_project_ids).execute()
+                
+                if hasattr(invited_projects_res, 'data') and isinstance(invited_projects_res.data, list):
+                    for proj in invited_projects_res.data:
+                        proj["access_level"] = "cloud_architect"
+                        projects_list.append(proj)
+
+        # Sort by newest first
+        projects_list.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+
+        return {"projects": projects_list}
+
+    except Exception as e:
+        print(f"🚨 Error fetching projects: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch projects")
+    
 
 @app.get("/chats/{project_id}")
 def get_chat_history(project_id: str, user=Depends(get_current_user)):
@@ -1001,8 +1359,22 @@ def get_chat_history(project_id: str, user=Depends(get_current_user)):
     if not project_res.data:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    if str(project_res.data[0]["user_id"]) != str(user.id):
-        raise HTTPException(status_code=403, detail="Unauthorized access")
+    # --- TEAM-FRIENDLY SECURITY CHECK ---
+    is_authorized = False
+    
+    # 1. Are they the Project Owner?
+    # 🔥 FIXED: Added right after .data
+    if str(project_res.data["user_id"]) == str(user.id):
+        is_authorized = True
+    else:
+        # 2. Are they an invited Cloud Architect?
+        member_res = supabase.table("project_members").select("id").eq("project_id", project_id).eq("user_id", user.id).execute()
+        if member_res.data and len(member_res.data) > 0:
+            is_authorized = True
+
+    if not is_authorized:
+        raise HTTPException(status_code=403, detail="Unauthorized access. Must be the project owner or an invited member.")
+    # ------------------------------------
 
     messages_res = (
         supabase.table("chat_messages")
@@ -1051,8 +1423,22 @@ def save_chat_message(payload: dict, user=Depends(get_current_user)):
     if not project_res.data:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    if str(project_res.data[0]["user_id"]) != str(user.id):
-        raise HTTPException(status_code=403, detail="Unauthorized access")
+    # --- TEAM-FRIENDLY SECURITY CHECK ---
+    is_authorized = False
+    
+    # 1. Are they the Project Owner?
+    # 🔥 FIXED: Added right after .data
+    if str(project_res.data["user_id"]) == str(user.id):
+        is_authorized = True
+    else:
+        # 2. Are they an invited Cloud Architect?
+        member_res = supabase.table("project_members").select("id").eq("project_id", project_id).eq("user_id", user.id).execute()
+        if member_res.data and len(member_res.data) > 0:
+            is_authorized = True
+
+    if not is_authorized:
+        raise HTTPException(status_code=403, detail="Unauthorized access. Must be the project owner or an invited member.")
+    # ------------------------------------
 
     insert_data = {
         "project_id": project_id,
@@ -1064,7 +1450,6 @@ def save_chat_message(payload: dict, user=Depends(get_current_user)):
 
     supabase.table("chat_messages").insert(insert_data).execute()
     return {"status": "success"}
-
 
 @app.post("/jobs/{job_id}/discard")
 def discard_job(job_id: str, user=Depends(get_current_user)):
