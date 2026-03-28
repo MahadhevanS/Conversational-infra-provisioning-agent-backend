@@ -8,9 +8,9 @@ SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
 # Replace these with your actual details
-SMTP_USERNAME = "falldetector91@gmail.com" 
+SMTP_USERNAME = "sportspose300@gmail.com" 
 # CRITICAL: This must be an App Password, NOT your normal Gmail password!
-SMTP_PASSWORD = "" 
+SMTP_PASSWORD = "yrbl fcab zzmb okba" 
 
 # Your React Frontend URL (Change this when you deploy to production!)
 FRONTEND_URL = "http://localhost:3000"

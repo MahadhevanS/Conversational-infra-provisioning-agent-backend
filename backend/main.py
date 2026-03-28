@@ -744,6 +744,7 @@ def login(payload: dict):
     try:
         return {
             "access_token": auth_response.session.access_token,
+            "user_id": auth_response.user.id,
             "email": auth_response.user.email,
             "full_name": auth_response.user.user_metadata.get("full_name", "") if auth_response.user.user_metadata else "",
             "role": user_role,
@@ -778,6 +779,8 @@ async def create_project_v2(request: Request, payload: dict, background_tasks: B
     environment = payload.get("environment", "development")
     invite_emails = payload.get("invite_emails") or []
 
+    print(f"📦 Project creation started: name={project_name}, emails={invite_emails}")  # ADD
+
     if not project_name:
         raise HTTPException(status_code=400, detail="Project name is required")
 
@@ -803,10 +806,12 @@ async def create_project_v2(request: Request, payload: dict, background_tasks: B
         
         if not project_id:
             raise ValueError("Could not extract project ID from database response.")
-            
+        print(f"✅ Project created: project_id={project_id}")  # ADD
     except Exception as e:
         print(f"🚨 Failed to create project: {e}")
         raise HTTPException(status_code=500, detail="Failed to create project")
+
+    print(f"📧 invite_emails received: {invite_emails}")  # ADD
 
     # 2. HANDLE INVITATIONS
     successful_invites = []
@@ -816,6 +821,8 @@ async def create_project_v2(request: Request, payload: dict, background_tasks: B
             email = email.strip()
             if not email: continue
             
+            print(f"🔄 Processing invite for: {email}")  # ADD
+
             try:
                 invite_res = supabase.table("project_invitations").insert({
                     "project_id": project_id,
@@ -824,6 +831,8 @@ async def create_project_v2(request: Request, payload: dict, background_tasks: B
                     "status": "pending"
                 }).execute()
                 
+                print(f"📬 invite_res.data = {invite_res.data}")  # ADD — critical
+
                 # Safe extraction for invitations
                 invite_data = invite_res.data
                 invite_token = None
@@ -831,8 +840,10 @@ async def create_project_v2(request: Request, payload: dict, background_tasks: B
                     if isinstance(item, dict):
                         invite_token = item.get("token")
                         break
+                print(f"🔑 invite_token extracted: {invite_token}")  # ADD
 
                 if invite_token:
+                    print(f"📤 Queuing background email to {email}")  # ADD
                     background_tasks.add_task(
                         send_invitation_email, email, project_name, admin_email, invite_token
                     )
@@ -841,6 +852,7 @@ async def create_project_v2(request: Request, payload: dict, background_tasks: B
             except Exception as e:
                 print(f"⚠️ Invitation failed for {email}: {e}")
 
+    print(f"🏁 Done. successful_invites={successful_invites}")  # ADD
     # 3. RETURN DATA
     return {
         "project_id": project_id,
@@ -1298,54 +1310,92 @@ def get_job_logs(job_id: str):
 
 @app.get("/projects")
 async def get_projects(request: Request):
-    # 1. Authenticate the user
+    # ---------------- AUTH ----------------
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing token")
-    
-    token = auth_header.split(" ")[1]  # ✅ FIX: grab the actual token string
-    
+
+    token = auth_header.split(" ")[1]
+
     try:
         user_res = supabase.auth.get_user(token)
-        user_id = user_res.user.id
+        user_id = str(user_res.user.id)
+        print("✅ LOGGED IN USER:", user_id)
     except Exception as e:
         print(f"🚨 SUPABASE REJECTED TOKEN: {e}")
         raise HTTPException(status_code=401, detail="Invalid session")
 
-    projects_list = []
-    
+    projects_map = {}  # 🔥 Use dict to avoid duplicates
+
     try:
-        # BATCH 1: Fetch projects the user OWNS
-        owned_res = supabase.table("projects").select("*").eq("user_id", user_id).execute()
-        
-        if hasattr(owned_res, 'data') and isinstance(owned_res.data, list):
+        # ---------------- BATCH 1: OWNED PROJECTS ----------------
+        owned_res = supabase.table("projects")\
+            .select("*")\
+            .eq("user_id", user_id)\
+            .execute()
+
+        if isinstance(owned_res.data, list):
             for proj in owned_res.data:
+                pid = str(proj.get("project_id"))
+                if not pid:
+                    continue
+
                 proj["access_level"] = "admin"
-                projects_list.append(proj)
+                projects_map[pid] = proj
 
-        # BATCH 2: Fetch projects the user is INVITED TO
-        member_res = supabase.table("project_members").select("project_id").eq("user_id", user_id).execute()
-        
-        if hasattr(member_res, 'data') and isinstance(member_res.data, list) and len(member_res.data) > 0:
-            invited_project_ids = [m.get("project_id") for m in member_res.data if m.get("project_id")]
-            
-            if invited_project_ids:
-                invited_projects_res = supabase.table("projects").select("*").in_("project_id", invited_project_ids).execute()
-                
-                if hasattr(invited_projects_res, 'data') and isinstance(invited_projects_res.data, list):
-                    for proj in invited_projects_res.data:
-                        proj["access_level"] = "cloud_architect"
-                        projects_list.append(proj)
+        # ---------------- BATCH 2: MEMBER PROJECTS ----------------
+        member_res = supabase.table("project_members")\
+            .select("project_id")\
+            .eq("user_id", user_id)\
+            .execute()
 
-        # Sort by newest first
-        projects_list.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        if isinstance(member_res.data, list) and len(member_res.data) > 0:
+
+            invited_project_ids = [
+                str(m.get("project_id"))
+                for m in member_res.data
+                if m.get("project_id")
+            ]
+
+            print("📌 MEMBER PROJECT IDS:", invited_project_ids)
+
+            # 🔥 SAFE FETCH (NO .in_())
+            for pid in invited_project_ids:
+                if not pid:
+                    continue
+
+                # Skip if already added as owner
+                if pid in projects_map:
+                    continue
+
+                res = supabase.table("projects")\
+                    .select("*")\
+                    .eq("project_id", pid)\
+                    .execute()
+
+                if isinstance(res.data, list) and len(res.data) > 0:
+                    proj = res.data[0]
+                    proj["access_level"] = "cloud_architect"
+                    projects_map[pid] = proj
+                else:
+                    print(f"⚠️ Project not found for project_id={pid}")
+
+        # ---------------- FINAL LIST ----------------
+        projects_list = list(projects_map.values())
+
+        # Sort newest first
+        projects_list.sort(
+            key=lambda x: x.get("created_at", ""),
+            reverse=True
+        )
+
+        print(f"✅ TOTAL PROJECTS RETURNED: {len(projects_list)}")
 
         return {"projects": projects_list}
 
     except Exception as e:
         print(f"🚨 Error fetching projects: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch projects")
-    
+        raise HTTPException(status_code=500, detail="Failed to fetch projects")    
 
 @app.get("/chats/{project_id}")
 def get_chat_history(project_id: str, user=Depends(get_current_user)):
@@ -1359,35 +1409,39 @@ def get_chat_history(project_id: str, user=Depends(get_current_user)):
     if not project_res.data:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # --- TEAM-FRIENDLY SECURITY CHECK ---
     is_authorized = False
-    
-    # 1. Are they the Project Owner?
-    # 🔥 FIXED: Added right after .data
-    if str(project_res.data["user_id"]) == str(user.id):
+
+    if str(project_res.data[0]["user_id"]) == str(user.id):  # ✅ fixed [0]
         is_authorized = True
     else:
-        # 2. Are they an invited Cloud Architect?
-        member_res = supabase.table("project_members").select("id").eq("project_id", project_id).eq("user_id", user.id).execute()
+        member_res = (
+            supabase.table("project_members")
+            .select("id")
+            .eq("project_id", project_id)
+            .eq("user_id", user.id)
+            .execute()
+        )
         if member_res.data and len(member_res.data) > 0:
             is_authorized = True
 
     if not is_authorized:
-        raise HTTPException(status_code=403, detail="Unauthorized access. Must be the project owner or an invited member.")
-    # ------------------------------------
+        raise HTTPException(
+            status_code=403,
+            detail="Unauthorized access. Must be the project owner or an invited member."
+        )
 
     messages_res = (
         supabase.table("chat_messages")
-        .select("message_id, sender, message_text, created_at, job_id")
+        .select("message_id, sender, sender_name, sender_role, message_text, created_at, job_id")  # ✅ new columns
         .eq("project_id", project_id)
         .order("created_at", desc=False)
         .execute()
     )
     messages = messages_res.data
 
-    jobs_res = supabase.table("jobs").select("*").eq("project_id", project_id).execute()
+    jobs_res  = supabase.table("jobs").select("*").eq("project_id", project_id).execute()
     jobs_list = jobs_res.data
-    jobs_map = {job["job_id"]: job for job in jobs_list}
+    jobs_map  = {job["job_id"]: job for job in jobs_list}
 
     cost_map = {}
     for job in jobs_list:
@@ -1414,35 +1468,44 @@ def save_chat_message(payload: dict, user=Depends(get_current_user)):
         raise HTTPException(status_code=400, detail="Missing chat data")
 
     project_res = (
-        supabase.table("projects")
-        .select("project_id, user_id")
-        .eq("project_id", project_id)
-        .execute()
+        supabase.table("projects").select("project_id, user_id")
+        .eq("project_id", project_id).execute()
     )
-
     if not project_res.data:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # --- TEAM-FRIENDLY SECURITY CHECK ---
     is_authorized = False
-    
-    # 1. Are they the Project Owner?
-    # 🔥 FIXED: Added right after .data
-    if str(project_res.data["user_id"]) == str(user.id):
+    if str(project_res.data[0]["user_id"]) == str(user.id):
         is_authorized = True
     else:
-        # 2. Are they an invited Cloud Architect?
-        member_res = supabase.table("project_members").select("id").eq("project_id", project_id).eq("user_id", user.id).execute()
+        member_res = supabase.table("project_members").select("id")\
+            .eq("project_id", project_id).eq("user_id", user.id).execute()
         if member_res.data and len(member_res.data) > 0:
             is_authorized = True
 
     if not is_authorized:
-        raise HTTPException(status_code=403, detail="Unauthorized access. Must be the project owner or an invited member.")
-    # ------------------------------------
+        raise HTTPException(status_code=403, detail="Unauthorized access")
+
+    # Fetch sender's name + role for group chat display
+    sender_name = "CloudCrafter"
+    sender_role = "bot"
+    if sender.upper() == "USER":
+        try:
+            profile_res = supabase.table("user_profiles")\
+                .select("full_name, role").eq("user_id", str(user.id)).execute()
+            if profile_res.data:
+                sender_name = profile_res.data[0].get("full_name") or user.email or "User"
+                sender_role = profile_res.data[0].get("role") or "admin"
+        except Exception as e:
+            print(f"⚠️ Could not fetch sender profile: {e}")
+            sender_name = user.email or "User"
+            sender_role = "admin"
 
     insert_data = {
         "project_id": project_id,
         "sender": sender.upper(),
+        "sender_name": sender_name,
+        "sender_role": sender_role,
         "message_text": message_text,
     }
     if job_id:
