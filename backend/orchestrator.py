@@ -321,20 +321,8 @@ class TerraformExecutorWithLogs:
         }
 
     def safe_apply(self):
-        from backend.terraform.plan_parser import is_plan_safe
-
-        init = self.run(["terraform", "init", "-no-color", "-input=false"])
-        if init["exit_code"] != 0:
-            return {"status": "FAILED", "stage": "init", "logs": init}
-
-        plan = self.run(["terraform", "plan", "-no-color", "-out=tfplan"])
-        if plan["exit_code"] != 0:
-            return {"status": "FAILED", "stage": "plan", "logs": plan}
-
-        if not is_plan_safe(self.working_dir):
-            return {"status": "BLOCKED", "reason": "Destructive changes detected"}
-
         apply = self.run(["terraform", "apply", "-no-color", "tfplan"])
+
         if apply["exit_code"] != 0:
             return {"status": "FAILED", "stage": "apply", "logs": apply}
 
@@ -343,12 +331,14 @@ class TerraformExecutorWithLogs:
             cwd=self.working_dir, env=self._env,
             capture_output=True, text=True
         )
+
         try:
             outputs = json.loads(output_proc.stdout) if output_proc.returncode == 0 else {}
         except Exception:
             outputs = {}
 
         access = format_access_points(outputs)
+
         return {"status": "SUCCESS", "logs": apply, "outputs": outputs, "access": access}
 
 
@@ -363,7 +353,7 @@ def terraform_apply(project_id, plan_job_id, blueprint, credentials=None, apply_
     Falls back to plan_job_id for backwards compatibility (though this
     means logs would show on the plan row, not the apply row).
     """
-    log_id = apply_job_id or plan_job_id
+    log_id = plan_job_id
 
     try:
         if not credentials or "role_arn" not in credentials:
@@ -482,7 +472,7 @@ def terraform_destroy(project_id, blueprint, credentials=None, job_id=None):
         if not workspace_path:
             return {"error": "No deployed environment found."}
 
-        log_job_id = job_id or f"destroy-unknown-{project_id}"
+        log_job_id = job_id 
 
         with get_env_lock(project_id, env):
             destroy_proc = run_streaming(

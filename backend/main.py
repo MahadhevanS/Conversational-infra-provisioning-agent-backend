@@ -12,12 +12,12 @@ from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 
-from backend.db import supabase
+from backend.db import supabase, make_auth_client
 from backend.orchestrator import terraform_plan, terraform_apply, terraform_destroy, terraform_cost
 from backend.lex import lex_webhook
 from backend.ai_analyser import analyse_failure
 
-from backend.email_service import send_invitation_email
+from backend.email_service import send_invitation_email, send_destroy_approval_email
 
 app = FastAPI()
 
@@ -131,7 +131,7 @@ def build_notification_key(title, metadata=None):
     ])
 
 
-def create_notification_for_user(user_id, title, message, type="INFO", metadata=None):
+def create_notification_for_user(project_id,user_id, title, message, type="INFO", metadata=None):
     try:
         if not user_id:
             print("⚠️ Skipping notification because user_id is missing")
@@ -154,6 +154,7 @@ def create_notification_for_user(user_id, title, message, type="INFO", metadata=
 
         insert_payload = {
             "user_id": str(user_id),
+            "project_id": str(project_id),
             "title": str(title),
             "message": str(message),
             "type": str(type),
@@ -169,17 +170,6 @@ def create_notification_for_user(user_id, title, message, type="INFO", metadata=
     except Exception as e:
         print(f"❌ Notification creation failed: {e}")
 
-
-def create_notification_for_project(project_id, title, message, type="INFO", metadata=None):
-    try:
-        user_id = get_project_user_id(project_id)
-        if not user_id:
-            print(f"⚠️ No user found for project {project_id}, skipping notification")
-            return
-        create_notification_for_user(user_id=user_id, title=title, message=message,
-                                     type=type, metadata=metadata)
-    except Exception as e:
-        print(f"❌ Failed to create project notification: {e}")
 
 
 # --- WORKERS WITH PERSISTENCE ---
@@ -269,155 +259,262 @@ def _fire_ai_analysis(project_id: str, job_id: str, job_type: str):
 
     threading.Thread(target=_run, daemon=True).start()
 
+# ===============================
+# PLAN WORKER (UNCHANGED LOG ROOT)
+# ===============================
 
-def run_plan_worker(project_id, job_id, blueprint, credentials=None):
+def run_plan_worker(project_id, job_id, blueprint, credentials=None, triggered_by=None):
     try:
         update_job_status(job_id, "RUNNING")
+
+        # 🔥 PLAN is the ROOT LOG STREAM
         result = terraform_plan(project_id, blueprint, job_id, credentials=credentials)
 
         if "error" in result:
-            print(f"❌ TERRAFORM ERROR: {result['error']}")
             update_job_status(job_id, "FAILED", result["error"])
-            create_notification_for_project(
-                project_id, "PLAN failed",
-                f"PLAN job failed for project {project_id}.", "ERROR",
-                {"job_id": job_id, "job_type": "PLAN"},
+
+            create_notification_for_user(
+                project_id=project_id,
+                user_id=triggered_by,
+                title="PLAN failed",
+                message=f"PLAN job failed for project {project_id}",
+                type="ERROR",
+                metadata={"job_id": job_id, "job_type": "PLAN"},
             )
+
             _fire_ai_analysis(project_id, job_id, "PLAN")
+
         else:
             update_job_status(job_id, "COMPLETED", result["structured_plan"])
-            create_notification_for_project(
-                project_id, "PLAN completed",
-                f"PLAN job completed successfully for project {project_id}.", "SUCCESS",
-                {"job_id": job_id, "job_type": "PLAN"},
+
+            create_notification_for_user(
+                project_id=project_id,
+                user_id=triggered_by,
+                title="PLAN completed",
+                message=f"PLAN job completed for project {project_id}",
+                type="SUCCESS",
+                metadata={"job_id": job_id, "job_type": "PLAN"},
             )
+
     except Exception as e:
-        print(f"❌ WORKER CRASHED: {str(e)}")
         update_job_status(job_id, "FAILED", str(e))
-        create_notification_for_project(
-            project_id, "PLAN failed",
-            f"PLAN job crashed for project {project_id}.", "ERROR",
-            {"job_id": job_id, "job_type": "PLAN"},
+
+        create_notification_for_user(
+            project_id=project_id,
+            user_id=triggered_by,
+            title="PLAN failed",
+            message=f"PLAN job failed for project {project_id}",
+            type="ERROR",
+            metadata={"job_id": job_id, "job_type": "PLAN"},
         )
+
         _fire_ai_analysis(project_id, job_id, "PLAN")
 
 
-def run_apply_worker(project_id, job_id, plan_job_id, blueprint, credentials=None):
+# ===============================
+# APPLY WORKER (FIXED)
+# ===============================
+
+def run_apply_worker(project_id, job_id, plan_job_id, blueprint, credentials=None, triggered_by=None):
     """
-    job_id      = the APPLY job's own id (status tracking AND log storage)
-    plan_job_id = the preceding plan job (locates the workspace on disk)
+    job_id      = APPLY job (status only)
+    plan_job_id = ROOT LOG STREAM (VERY IMPORTANT)
     """
     try:
         update_job_status(job_id, "RUNNING")
 
-        # FIX B: pass apply_job_id so orchestrator stores logs on the apply job,
-        # not the plan job.  Previously this arg was missing → logs were invisible
-        # in the LogPanel because the frontend polls apply_job_id.
+        # 🔥 CRITICAL FIX: store logs in PLAN JOB ID
         result = terraform_apply(
             project_id,
             plan_job_id,
             blueprint,
             credentials=credentials,
-            apply_job_id=job_id,
+            apply_job_id=plan_job_id,   # ✅ FIXED
         )
 
         if "error" in result:
             update_job_status(job_id, "FAILED", result)
-            create_notification_for_project(
-                project_id, "Deployment failed",
-                f"Infrastructure deployment failed for project {project_id}.", "ERROR",
-                {"job_id": job_id, "job_type": "APPLY", "plan_job_id": plan_job_id},
+
+            create_notification_for_user(
+                project_id=project_id,
+                user_id=triggered_by,
+                title="Deployment failed",
+                message=f"Infrastructure deployment failed for project {project_id}",
+                type="ERROR",
+                metadata={
+                    "job_id": plan_job_id,   # ✅ FIXED
+                    "job_type": "APPLY"
+                },
             )
-            _fire_ai_analysis(project_id, job_id, "APPLY")
+
+            _fire_ai_analysis(project_id, plan_job_id, "APPLY")
+
         else:
             update_job_status(job_id, "COMPLETED", result)
-            create_notification_for_project(
-                project_id, "Deployment completed",
-                f"Infrastructure deployed successfully for project {project_id}.", "SUCCESS",
-                {"job_id": job_id, "job_type": "APPLY", "plan_job_id": plan_job_id},
+
+            create_notification_for_user(
+                project_id=project_id,
+                user_id=triggered_by,
+                title="Deployment completed",
+                message=f"Infrastructure deployed for project {project_id}",
+                type="SUCCESS",
+                metadata={
+                    "job_id": plan_job_id,   # ✅ FIXED
+                    "job_type": "APPLY"
+                },
             )
 
     except Exception as e:
         update_job_status(job_id, "FAILED", str(e))
-        create_notification_for_project(
-            project_id, "Deployment failed",
-            f"Infrastructure deployment crashed for project {project_id}.", "ERROR",
-            {"job_id": job_id, "job_type": "APPLY", "plan_job_id": plan_job_id},
+
+        create_notification_for_user(
+            project_id=project_id,
+            user_id=triggered_by,
+            title="Deployment failed",
+            message=f"Infrastructure deployment failed for project {project_id}",
+            type="ERROR",
+            metadata={
+                "job_id": plan_job_id,   # ✅ FIXED
+                "job_type": "APPLY"
+            },
         )
-        _fire_ai_analysis(project_id, job_id, "APPLY")
+
+        _fire_ai_analysis(project_id, plan_job_id, "APPLY")
 
 
-def run_cost_worker(project_id, job_id, run_id, blueprint, credentials=None):
+# ===============================
+# COST WORKER (UNCHANGED)
+# ===============================
+
+def run_cost_worker(project_id, job_id, run_id, blueprint, credentials=None, triggered_by=None):
     try:
         update_job_status(job_id, "RUNNING")
+
         result = terraform_cost(project_id, run_id, blueprint, credentials=credentials)
 
         if "error" in result:
             update_job_status(job_id, "FAILED", result)
-            create_notification_for_project(
-                project_id, "Cost estimation failed",
-                f"Cost estimation failed for project {project_id}.", "ERROR",
-                {"job_id": job_id, "job_type": "COST", "run_id": run_id},
+
+            create_notification_for_user(
+                project_id=project_id,
+                user_id=triggered_by,
+                title="Cost estimation failed",
+                message=f"Cost estimation failed for project {project_id}",
+                type="ERROR",
+                metadata={"job_id": job_id, "job_type": "COST"},
             )
+
         else:
             update_job_status(job_id, "COMPLETED", result)
-            create_notification_for_project(
-                project_id, "Cost estimation ready",
-                f"Cost estimate is ready for project {project_id}.", "SUCCESS",
-                {"job_id": job_id, "job_type": "COST", "run_id": run_id},
+
+            create_notification_for_user(
+                project_id=project_id,
+                user_id=triggered_by,
+                title="Cost estimation ready",
+                message=f"Cost estimation completed for project {project_id}",
+                type="SUCCESS",
+                metadata={"job_id": job_id, "job_type": "COST"},
             )
+
     except Exception as e:
         update_job_status(job_id, "FAILED", str(e))
-        create_notification_for_project(
-            project_id, "Cost estimation failed",
-            f"Cost estimation crashed for project {project_id}.", "ERROR",
-            {"job_id": job_id, "job_type": "COST", "run_id": run_id},
+
+        create_notification_for_user(
+            project_id=project_id,
+            user_id=triggered_by,
+            title="Cost estimation failed",
+            message=f"Cost estimation crashed for project {project_id}.",
+            type="ERROR",
+            metadata={"job_id": job_id, "job_type": "COST"},
         )
 
 
-def run_destroy_worker(project_id, job_id, blueprint, credentials=None):
+# ===============================
+# DESTROY WORKER (FIXED)
+# ===============================
+
+def run_destroy_worker(project_id, job_id, blueprint, credentials=None, triggered_by=None, plan_job_id=None):
+    """
+    plan_job_id = ROOT LOG STREAM (if destroy is chained)
+    """
+
     try:
-        print(f"🚀 Destroy worker started for project_id={project_id}, job_id={job_id}")
         update_job_status(job_id, "RUNNING")
 
-        # FIX C: pass job_id so orchestrator stores destroy logs on the destroy
-        # job row, not a fallback "destroy-unknown-*" id that the frontend never polls.
+        # 🔥 Use PLAN LOG STREAM if available
+        log_job_id = plan_job_id or job_id
+
         result = terraform_destroy(
             project_id,
             blueprint,
             credentials=credentials,
-            job_id=job_id,
+            job_id=log_job_id,   # ✅ FIXED
         )
-        print(f"🧾 Destroy result for {job_id}: {result}")
 
         if isinstance(result, dict) and "error" in result:
             update_job_status(job_id, "FAILED", result.get("error"))
-            create_notification_for_project(
-                project_id, "Destroy failed",
-                f"Infrastructure destruction failed for project {project_id}.", "ERROR",
-                {"job_id": job_id, "job_type": "DESTROY"},
+
+            create_notification_for_user(
+                project_id=project_id,
+                user_id=triggered_by,
+                title="Destroy failed",
+                message=f"Infrastructure destruction failed for project {project_id}",
+                type="ERROR",
+                metadata={
+                    "job_id": log_job_id,   # ✅ FIXED
+                    "job_type": "DESTROY"
+                },
             )
-            _fire_ai_analysis(project_id, job_id, "DESTROY")
-            print(f"❌ Destroy failed notification sent for job_id={job_id}")
+
+            _fire_ai_analysis(project_id, log_job_id, "DESTROY")
+
         else:
             update_job_status(job_id, "COMPLETED", result)
-            create_notification_for_project(
-                project_id, "Destroy completed",
-                f"All infrastructure destroyed successfully for project {project_id}.", "SUCCESS",
-                {"job_id": job_id, "job_type": "DESTROY"},
+
+            create_notification_for_user(
+                project_id=project_id,
+                user_id=triggered_by,
+                title="Destroy completed",
+                message=f"Infrastructure destroyed for project {project_id}",
+                type="SUCCESS",
+                metadata={
+                    "job_id": log_job_id,   # ✅ FIXED
+                    "job_type": "DESTROY"
+                },
             )
-            print(f"✅ Destroy completed notification sent for job_id={job_id}")
 
     except Exception as e:
-        print(f"❌ Destroy worker crashed for job_id={job_id}: {str(e)}")
         update_job_status(job_id, "FAILED", str(e))
-        create_notification_for_project(
-            project_id, "Destroy failed",
-            f"Destroy process crashed for project {project_id}.", "ERROR",
-            {"job_id": job_id, "job_type": "DESTROY"},
-        )
-        _fire_ai_analysis(project_id, job_id, "DESTROY")
 
+        create_notification_for_user(
+            project_id=project_id,
+            user_id=triggered_by,
+            title="Destroy failed",
+            message=f"Infrastructure destruction crashed for project {project_id}.",
+            type="ERROR",
+            metadata={
+                "job_id": log_job_id,   # ✅ FIXED
+                "job_type": "DESTROY"
+            },
+        )
+
+        _fire_ai_analysis(project_id, log_job_id, "DESTROY")
+
+def post_bot_chat_message(project_id: str, message_text: str, job_id: str = None):
+    """Save a CloudCrafter bot message to the project chat feed."""
+    try:
+        insert_data = {
+            "project_id":   project_id,
+            "sender":       "BOT",
+            "sender_name":  "CloudCrafter",
+            "sender_role":  "bot",
+            "message_text": message_text,
+        }
+        if job_id:
+            insert_data["job_id"] = job_id
+        supabase.table("chat_messages").insert(insert_data).execute()
+    except Exception as e:
+        print(f"⚠️ Failed to post bot chat message: {e}")
 
 # --- NOTIFICATION MODELS ---
 
@@ -464,95 +561,60 @@ def create_notification(payload: NotificationCreate, user=Depends(get_current_us
 
 
 @app.get("/notifications")
-def get_notifications(user_id: str, user=Depends(get_current_user)):
+def get_notifications(user=Depends(get_current_user)):
     try:
-        if str(user.id) != str(user_id):
-            raise HTTPException(status_code=403, detail="Unauthorized access")
-
         res = (
             supabase.table("notifications")
-            .select("id, user_id, title, message, type, is_read, is_deleted, created_at, metadata, notification_key")
-            .eq("user_id", user_id)
+            .select("id, user_id, project_id, job_id, title, message, type, is_read, is_deleted, created_at, metadata, notification_key")
+            .eq("user_id", str(user.id))
             .eq("is_deleted", False)
             .order("created_at", desc=True)
             .execute()
         )
 
         return {"success": True, "notifications": res.data or []}
-    except HTTPException:
-        raise
+
     except Exception as e:
         print(f"❌ /notifications failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch notifications: {str(e)}")
-
+        raise HTTPException(status_code=500, detail="Failed to fetch notifications")
 
 @app.get("/notifications/unread-count")
-def get_unread_count(user_id: str, user=Depends(get_current_user)):
+def get_unread_count(user=Depends(get_current_user)):
     try:
-        if str(user.id) != str(user_id):
-            raise HTTPException(status_code=403, detail="Unauthorized access")
-
         res = (
             supabase.table("notifications")
             .select("id")
-            .eq("user_id", user_id)
+            .eq("user_id", str(user.id))
             .eq("is_read", False)
             .eq("is_deleted", False)
             .execute()
         )
 
         return {"success": True, "unread_count": len(res.data or [])}
-    except HTTPException:
-        raise
+
     except Exception as e:
-        print(f"❌ /notifications/unread-count failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch unread count: {str(e)}")
+        print(f"❌ unread-count failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch unread count")
 
 
 @app.put("/notifications/read-all")
-def mark_all_notifications_read(user_id: str, user=Depends(get_current_user)):
-    try:
-        if str(user.id) != str(user_id):
-            raise HTTPException(status_code=403, detail="Unauthorized access")
+def mark_all_notifications_read(user=Depends(get_current_user)):
+    supabase.table("notifications")\
+        .update({"is_read": True})\
+        .eq("user_id", str(user.id))\
+        .eq("is_deleted", False)\
+        .execute()
 
-        res = (
-            supabase.table("notifications")
-            .update({"is_read": True})
-            .eq("user_id", user_id)
-            .eq("is_read", False)
-            .eq("is_deleted", False)
-            .execute()
-        )
-
-        return {"success": True, "updated": len(res.data) if res.data else 0}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to mark all notifications as read: {str(e)}")
-
+    return {"success": True}
 
 @app.delete("/notifications/clear-all")
-def clear_all_notifications(user_id: str, user=Depends(get_current_user)):
-    try:
-        if str(user.id) != str(user_id):
-            raise HTTPException(status_code=403, detail="Unauthorized access")
+def clear_all_notifications(user=Depends(get_current_user)):
+    supabase.table("notifications")\
+        .update({"is_deleted": True})\
+        .eq("user_id", str(user.id))\
+        .execute()
 
-        res = (
-            supabase.table("notifications")
-            .update({"is_deleted": True})
-            .eq("user_id", user_id)
-            .eq("is_deleted", False)
-            .execute()
-        )
-
-        print(f"🗑️ Soft-cleared all notifications for user {user_id}: {res.data}")
-        return {"success": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ clear-all failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to clear notifications: {str(e)}")
-
+    return {"success": True}
 
 @app.delete("/notifications/{notification_id}")
 def delete_notification(notification_id: str, user=Depends(get_current_user)):
@@ -618,13 +680,12 @@ def mark_notification_read(notification_id: str, user=Depends(get_current_user))
 
 @app.post("/signup")
 def signup(payload: dict):
-    email = payload.get("email")
-    password = payload.get("password")
-    role_arn = payload.get("role_arn")
+    email       = payload.get("email")
+    password    = payload.get("password")
+    role_arn    = payload.get("role_arn")
     external_id = payload.get("external_id")
-    full_name = payload.get("full_name", "")
-    
-    # 🔥 RBAC: Get the role from the frontend, default to 'admin' if empty
+    full_name   = payload.get("full_name", "")
+
     requested_role = payload.get("role", "admin")
     if requested_role not in ["admin", "cloud_architect"]:
         requested_role = "admin"
@@ -632,8 +693,11 @@ def signup(payload: dict):
     if not email or not password or not role_arn:
         raise HTTPException(status_code=400, detail="email, password, and role_arn required")
 
+    # 🔥 One-shot auth client — never touches the shared service-role client
+    auth_client = make_auth_client()
+
     try:
-        auth_response = supabase.auth.sign_up({
+        auth_response = auth_client.auth.sign_up({
             "email": email,
             "password": password,
             "options": {"data": {"full_name": full_name}},
@@ -641,123 +705,133 @@ def signup(payload: dict):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    if not auth_response.user:
+        raise HTTPException(status_code=400, detail="Signup failed. Please try again.")
+
     user_id = auth_response.user.id
 
+    # Validate the IAM role ARN against AWS STS
     try:
         access_key = os.environ.get("AWS_ACCESS_KEY_ID", "").replace('"', "").replace("'", "").strip()
         secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "").replace('"', "").replace("'", "").strip()
-        region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1").replace('"', "").replace("'", "").strip()
+        region     = os.environ.get("AWS_DEFAULT_REGION", "us-east-1").replace('"', "").replace("'", "").strip()
 
-        sts = boto3.client("sts", aws_access_key_id=access_key,
-                           aws_secret_access_key=secret_key, region_name=region)
+        sts = boto3.client(
+            "sts",
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region
+        )
         assume_params = {"RoleArn": role_arn, "RoleSessionName": "SignupValidation"}
         if external_id:
             assume_params["ExternalId"] = external_id
         sts.assume_role(**assume_params)
 
     except Exception as e:
+        # Roll back the created auth user before raising
         try:
             supabase.auth.admin.delete_user(user_id)
-        except Exception as rollback_error:
-            print(f"⚠️ Warning: Could not delete user {user_id}. Error: {rollback_error}")
+        except Exception as rollback_err:
+            print(f"⚠️ Could not delete user {user_id} during rollback: {rollback_err}")
         raise HTTPException(status_code=400, detail=f"IAM Role validation failed: {str(e)}")
 
+    # Persist credentials and profile using the service-role client
     try:
-        # Save AWS Credentials
         supabase.table("aws_credentials").insert({
-            "user_id": user_id,
-            "role_arn": role_arn,
+            "user_id":     str(user_id),
+            "role_arn":    role_arn,
             "external_id": external_id,
         }).execute()
-        
-        # 🔥 RBAC: Save the user's role to the new profiles table!
+
         supabase.table("user_profiles").insert({
-            "user_id": user_id,
-            "email": email,
+            "user_id":   str(user_id),
+            "email":     email,
             "full_name": full_name,
-            "role": requested_role
+            "role":      requested_role,
         }).execute()
-        
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Database storage failed: {str(e)}")
 
     return {
         "message": "Signup successful! Please check your email to verify your account.",
-        "user_id": user_id,
+        "user_id": str(user_id),
     }
 
 @app.post("/login")
 def login(payload: dict):
-    email = payload.get("email")
+    email    = payload.get("email")
     password = payload.get("password")
 
     if not email or not password:
         raise HTTPException(status_code=400, detail="Email and password required")
 
-    # 1. Authenticate with Supabase
+    # 🔥 One-shot auth client — sign_in never touches the shared service-role client
+    auth_client = make_auth_client()
+
     try:
-        auth_response = supabase.auth.sign_in_with_password({
+        auth_response = auth_client.auth.sign_in_with_password({
             "email": email,
             "password": password,
         })
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    user_id = auth_response.user.id
+    if not auth_response.user or not auth_response.session:
+        raise HTTPException(status_code=400, detail="Login failed. Please check your credentials.")
 
-    # 2. Role Extraction
+    user_id = str(auth_response.user.id)
+
+    # ── Role extraction ────────────────────────────────────────────────────
     user_role = ""
     try:
-        profile_res = supabase.table("user_profiles").select("role").eq("user_id", user_id).execute()
-
-        if hasattr(profile_res, 'data') and isinstance(profile_res.data, list) and len(profile_res.data) > 0:
-            first_row = profile_res.data[0]  # ✅ FIX: added [0]
-            if isinstance(first_row, dict):
-                user_role = first_row.get("role", "")
-
+        profile_res = supabase.table("user_profiles")\
+            .select("role")\
+            .eq("user_id", user_id)\
+            .execute()
+        if profile_res.data and len(profile_res.data) > 0:
+            user_role = profile_res.data[0].get("role", "")
     except Exception as e:
-        print(f"⚠️ Warning: Profile extraction failed. Error: {e}")
+        print(f"⚠️ Profile extraction failed: {e}")
 
-    # 3. AWS Credentials Extraction
+    # ── AWS credentials extraction ─────────────────────────────────────────
     aws_account_id = ""
-    role_arn = ""
-    external_id = ""
+    role_arn       = ""
+    external_id    = ""
 
     try:
-        aws_res = supabase.table("aws_credentials").select("*").eq("user_id", user_id).execute()
-
-        if hasattr(aws_res, 'data') and isinstance(aws_res.data, list) and len(aws_res.data) > 0:
-            first_aws = aws_res.data[0]  # ✅ FIX: added [0]
-            if isinstance(first_aws, dict):
-                role_arn = first_aws.get("role_arn", "")
-                external_id = first_aws.get("external_id", "")
-
-                if role_arn and ":" in role_arn:
-                    arn_parts = role_arn.split(":")
-                    if len(arn_parts) >= 5:
-                        aws_account_id = arn_parts[4]  # ✅ FIX: added [4]
-
+        aws_res = supabase.table("aws_credentials")\
+            .select("role_arn, external_id")\
+            .eq("user_id", user_id)\
+            .execute()
+        if aws_res.data and len(aws_res.data) > 0:
+            first = aws_res.data[0]
+            role_arn    = first.get("role_arn", "")
+            external_id = first.get("external_id", "")
+            if role_arn and ":" in role_arn:
+                parts = role_arn.split(":")
+                if len(parts) >= 5:
+                    aws_account_id = parts[4]
     except Exception as e:
-        print(f"⚠️ Warning: AWS extraction failed. Error: {e}")
+        print(f"⚠️ AWS credentials extraction failed: {e}")
 
-    # 4. Return Payload
+    # ── Return payload ─────────────────────────────────────────────────────
     try:
         return {
-            "access_token": auth_response.session.access_token,
-            "user_id": auth_response.user.id,
-            "email": auth_response.user.email,
-            "full_name": auth_response.user.user_metadata.get("full_name", "") if auth_response.user.user_metadata else "",
-            "role": user_role,
+            "access_token":  auth_response.session.access_token,
+            "user_id":       user_id,
+            "email":         auth_response.user.email,
+            "full_name":     auth_response.user.user_metadata.get("full_name", "")
+                             if auth_response.user.user_metadata else "",
+            "role":          user_role,
             "aws_account_id": aws_account_id,
-            "aws_region": "us-east-1",
-            "role_arn": role_arn,
-            "external_id": external_id
+            "aws_region":    "us-east-1",
+            "role_arn":      role_arn,
+            "external_id":   external_id,
         }
     except Exception as e:
-        import traceback
-        print("🚨 CRITICAL ERROR formatting login return payload:")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Failed to format login response data.")
+        raise HTTPException(status_code=500, detail="Failed to format login response.")
 
 
 @app.post("/projects/create")  # 🔥 NOTICE THE NEW URL!
@@ -929,53 +1003,6 @@ async def invite_architect(project_id: str, request: Request, payload: dict, bac
         print(f"🚨 Invite Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to send invitation.")
 
-@app.delete("/projects/{project_id}/members/{email}")
-async def remove_architect(project_id: str, email: str, request: Request):
-    auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing token")
-    
-    # 🔥 FIXED: Added.strip()
-    token = auth_header.split(" ").strip()
-    
-    try:
-        user_res = supabase.auth.get_user(token)
-        admin_id = user_res.user.id
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid session")
-
-    # 2. SECURITY CHECK
-    # 🔥 FIXED: Changed "owner_id" to "user_id"
-    proj_res = supabase.table("projects").select("user_id").eq("project_id", project_id).execute()
-    if not proj_res.data or len(proj_res.data) == 0:
-        raise HTTPException(status_code=404, detail="Project not found.")
-    
-    # 🔥 FIXED: Added
-    if proj_res.data.get("user_id") != admin_id:
-        raise HTTPException(status_code=403, detail="Only the project Admin can remove members.")
-
-    try:
-        profile_res = supabase.table("user_profiles").select("user_id").eq("email", email).execute()
-        
-        if not (hasattr(profile_res, 'data') and isinstance(profile_res.data, list) and len(profile_res.data) > 0):
-            raise HTTPException(status_code=404, detail=f"No account found for {email}.")
-            
-        # 🔥 FIXED: Added
-        target_user_id = profile_res.data.get("user_id")
-
-        delete_res = supabase.table("project_members").delete().eq("project_id", project_id).eq("user_id", target_user_id).execute()
-        
-        if not delete_res.data or len(delete_res.data) == 0:
-            return {"message": f"{email} is not a member of this project."}
-
-        return {"message": f"Successfully removed {email} from the project."}
-
-    except HTTPException:
-        raise 
-    except Exception as e:
-        print(f"🚨 Removal Error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to remove member.")
-
 @app.post("/invitations/{token}/accept")
 async def accept_invitation(token: str, request: Request):
     auth_header = request.headers.get("Authorization")
@@ -1073,13 +1100,20 @@ def plan_infra(payload: dict):
         "log_chunks": [],
     }).execute()
 
-    create_notification_for_project(
-        project_id, "PLAN started", f"PLAN job has started in {env}.", "INFO",
-        {"job_id": job_id, "job_type": "PLAN"},
+    create_notification_for_user(
+        project_id=project_id,
+        user_id=payload.get("user_id"),
+        title="PLAN started",
+        message=f"PLAN job has started in {env}.",
+        type="INFO",
+        metadata={"job_id": job_id, "job_type": "PLAN"},
     )
 
     threading.Thread(
-        target=run_plan_worker, args=(project_id, job_id, blueprint, credentials), daemon=True
+        target=run_plan_worker,
+        args=(project_id, job_id, blueprint, credentials),
+        kwargs={"triggered_by": payload.get("user_id")},
+        daemon=True
     ).start()
 
     return {"status": "accepted", "job_id": job_id}
@@ -1109,14 +1143,20 @@ def cost_infra(payload: dict):
         "log_chunks": [],
     }).execute()
 
-    create_notification_for_project(
-        project_id, "Cost estimation started",
-        f"Cost estimation started for project {project_id}.", "INFO",
-        {"job_id": job_id, "job_type": "COST", "run_id": run_id},
+    create_notification_for_user(
+        project_id=project_id,
+        user_id=payload.get("user_id"),
+        title="Cost estimation started",
+        message=f"Cost estimation has started for project {project_id}.",
+        type="INFO",
+        metadata={"job_id": job_id, "job_type": "COST", "run_id": run_id},
     )
-
+    
     threading.Thread(
-        target=run_cost_worker, args=(project_id, job_id, run_id, blueprint, credentials), daemon=True
+        target=run_cost_worker,
+        args=(project_id, job_id, run_id, blueprint, credentials),
+        kwargs={"triggered_by": payload.get("user_id")},
+        daemon=True,
     ).start()
 
     return {"status": "accepted", "job_id": job_id, "run_id": run_id}
@@ -1150,53 +1190,344 @@ def apply_infra(payload: dict):
         "log_chunks": [],
     }).execute()
 
-    create_notification_for_project(
-        project_id, "Deployment started",
-        f"Deployment has started for project {project_id}.", "INFO",
-        {"job_id": job_id, "job_type": "APPLY", "plan_job_id": plan_job_id},
+    create_notification_for_user(
+        project_id=project_id,
+        user_id=payload.get("user_id"),
+        title="Deployment started",
+        message=f"Deployment has started for project {project_id}.",
+        type="INFO",
+        metadata={"job_id": job_id, "job_type": "APPLY", "plan_job_id": plan_job_id},
     )
 
     threading.Thread(
         target=run_apply_worker,
         args=(project_id, job_id, plan_job_id, blueprint, credentials),
+        kwargs={"triggered_by": payload.get("user_id")},
         daemon=True,
     ).start()
 
     return {"status": "accepted", "apply_job_id": job_id}
 
-
 @app.post("/destroy")
-def destroy_infra(payload: dict):
+def destroy_infra(payload: dict, request: Request):
     project_id = payload.get("project_id")
-    blueprint = payload.get("infra_blueprint") or {}
+    blueprint  = payload.get("infra_blueprint") or {}
 
     if not project_id:
         raise HTTPException(status_code=400, detail="project_id required")
 
-    # No user auth header here — /destroy is called server-to-server from
-    # lex.py (urllib.request, no Authorization header).  Security is provided
-    # by get_project_credentials: it verifies the project exists in the DB and
-    # that AWS credentials are on file before any Terraform work starts.
-    # The Lex session only ever holds the user's own project_id, so there is
-    # no cross-tenant risk on this internal path.
     credentials = get_project_credentials(project_id)
+
+    caller_user_id = payload.get("caller_user_id")
+    caller_role    = payload.get("caller_role", "admin")
+
+    # ── Architect path → approval request ─────────────────────────────────
+    if caller_role == "cloud_architect" and caller_user_id:
+
+        # Fetch architect profile with proper fallbacks
+        architect_name  = "Cloud Architect"
+        architect_email = ""
+
+        try:
+            profile_res = supabase.table("user_profiles")\
+                .select("full_name, email")\
+                .eq("user_id", caller_user_id)\
+                .execute()
+
+            if profile_res.data:
+                architect_name  = profile_res.data[0].get("full_name") or "Cloud Architect"
+                architect_email = profile_res.data[0].get("email") or ""
+
+        except Exception as e:
+            print(f"⚠️ Could not fetch architect profile: {e}")
+
+        # Fallback to auth table if email still missing
+        if not architect_email:
+            try:
+                auth_user = supabase.auth.admin.get_user_by_id(caller_user_id)
+                architect_email = auth_user.user.email or ""
+                if architect_name == "Cloud Architect" and auth_user.user.user_metadata:
+                    architect_name = auth_user.user.user_metadata.get("full_name") or architect_email
+            except Exception as e:
+                print(f"⚠️ Could not fetch architect from auth: {e}")
+
+        print(f"👷 Architect: name={architect_name}, email={architect_email}")
+
+        # Fetch project name + admin user_id
+        project_name  = project_id
+        admin_user_id = None
+
+        try:
+            proj_res = supabase.table("projects")\
+                .select("project_name, user_id")\
+                .eq("project_id", project_id)\
+                .execute()
+
+            if proj_res.data:
+                project_name  = proj_res.data[0].get("project_name") or project_id
+                admin_user_id = proj_res.data[0].get("user_id")
+
+        except Exception as e:
+            print(f"⚠️ Could not fetch project info: {e}")
+
+        if not admin_user_id:
+            raise HTTPException(status_code=404, detail="Could not find project admin.")
+
+        # Fetch admin profile with proper fallbacks
+        admin_name  = "Admin"
+        admin_email = ""
+
+        try:
+            admin_profile_res = supabase.table("user_profiles")\
+                .select("full_name, email")\
+                .eq("user_id", admin_user_id)\
+                .execute()
+
+            if admin_profile_res.data:
+                admin_name  = admin_profile_res.data[0].get("full_name") or "Admin"
+                admin_email = admin_profile_res.data[0].get("email") or ""
+
+        except Exception as e:
+            print(f"⚠️ Could not fetch admin profile: {e}")
+
+        # Fallback to auth table if admin email still missing
+        if not admin_email:
+            try:
+                auth_admin = supabase.auth.admin.get_user_by_id(admin_user_id)
+                admin_email = auth_admin.user.email or ""
+                if admin_name == "Admin" and auth_admin.user.user_metadata:
+                    admin_name = auth_admin.user.user_metadata.get("full_name") or admin_email
+            except Exception as e:
+                print(f"⚠️ Could not fetch admin from auth: {e}")
+
+        print(f"👑 Admin: name={admin_name}, email={admin_email}")
+
+        if not admin_email:
+            raise HTTPException(
+                status_code=500,
+                detail="Could not resolve admin email. Cannot send approval request."
+            )
+
+        scope = payload.get("scope", "ALL")
+
+        # Create the approval record
+        try:
+            approval_res = supabase.table("destroy_approvals").insert({
+                "project_id":         project_id,
+                "requested_by":       caller_user_id,
+                "requested_by_email": architect_email,
+                "requested_by_name":  architect_name,
+                "admin_id":           str(admin_user_id),
+                "admin_email":        admin_email,
+                "blueprint":          blueprint or None,
+                "scope":              scope,
+                "status":             "pending",
+            }).execute()
+        except Exception as e:
+            print(f"❌ Failed to create destroy approval record: {e}")
+            raise HTTPException(status_code=500, detail="Failed to create approval request.")
+
+        approval_token = approval_res.data[0]["token"] if approval_res.data else None
+
+        if not approval_token:
+            raise HTTPException(status_code=500, detail="Approval token was not generated.")
+
+        print(f"🔑 Approval token created: {approval_token}")
+
+        # Send email to admin in background
+        threading.Thread(
+            target=send_destroy_approval_email,
+            args=(
+                admin_email,
+                admin_name,
+                project_name,
+                architect_name,
+                architect_email,
+                scope,
+                str(approval_token),
+            ),
+            daemon=True,
+        ).start()
+
+        # Post to chat feed so both users see the request was made
+        post_bot_chat_message(
+            project_id=project_id,
+            message_text=(
+                f"⏳ {architect_name} has requested to destroy infrastructure "
+                f"({'entire environment' if scope == 'ALL' else 'selected resources'}). "
+                f"Waiting for admin approval."
+            ),
+        )
+
+        # Notify the architect
+        create_notification_for_user(
+            project_id=project_id,
+            user_id=caller_user_id,
+            title="Destroy approval requested",
+            message=f"Your request to destroy infrastructure in '{project_name}' has been sent to {admin_name} for approval.",
+            type="INFO",
+            metadata={"project_id": project_id, "job_type": "DESTROY_APPROVAL"},
+        )
+
+        return {
+            "status":          "pending_approval",
+            "message":         "Destroy request sent to admin for approval.",
+            "approval_token":  str(approval_token),
+        }
+
+    # ── Admin path → existing flow ─────────────────────────────────────────
     job_id = f"destroy-{uuid.uuid4()}"
 
     supabase.table("jobs").insert({
-        "job_id": job_id,
+        "job_id":     job_id,
         "project_id": project_id,
-        "job_type": "DESTROY",
-        "status": "RUNNING",
-        "env": blueprint.get("environment") if blueprint else None,
+        "job_type":   "DESTROY",
+        "status":     "RUNNING",
+        "env":        blueprint.get("environment") if blueprint else None,
         "log_chunks": [],
     }).execute()
 
     print(f"🔥 Destroy request accepted for project_id={project_id}, job_id={job_id}")
 
-    create_notification_for_project(
-        project_id, "Destroy started",
-        f"Infrastructure destruction has started for project {project_id}.", "INFO",
-        {"job_id": job_id, "job_type": "DESTROY"},
+    create_notification_for_user(
+        project_id=project_id,
+        user_id=caller_user_id,
+        title="Destroy started",
+        message=f"Infrastructure destruction has started for project {project_id}.",
+        type="INFO",
+        metadata={"job_id": job_id, "job_type": "DESTROY"},
+    )
+
+    threading.Thread(
+        target=run_destroy_worker,
+        args=(project_id, job_id, blueprint, credentials),
+        kwargs={"triggered_by": caller_user_id},
+        daemon=True,
+    ).start()
+
+    return {"status": "accepted", "job_id": job_id}
+
+@app.get("/destroy-approvals/{token}")
+async def get_destroy_approval(token: str, request: Request):
+    """Returns approval request details for the ApproveDestroy page."""
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    access_token = auth_header.split(" ")[1].strip()
+    try:
+        user_res = supabase.auth.get_user(access_token)
+        caller_id = str(user_res.user.id)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+    res = supabase.table("destroy_approvals")\
+        .select("*")\
+        .eq("token", token)\
+        .execute()
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Approval request not found or expired.")
+
+    approval = res.data[0]
+
+    # Only the project admin can view/action this
+    if str(approval["admin_id"]) != caller_id:
+        raise HTTPException(status_code=403, detail="Only the project admin can review this request.")
+
+    # Fetch project name for display
+    proj_res = supabase.table("projects")\
+        .select("project_name")\
+        .eq("project_id", approval["project_id"])\
+        .execute()
+    project_name = proj_res.data[0]["project_name"] if proj_res.data else approval["project_id"]
+
+    return {
+        "token":                str(approval["token"]),
+        "project_id":           approval["project_id"],
+        "project_name":         project_name,
+        "requested_by_name":    approval["requested_by_name"],
+        "requested_by_email":   approval["requested_by_email"],
+        "scope":                approval["scope"],
+        "status":               approval["status"],
+        "created_at":           approval["created_at"],
+        "expires_at":           approval["expires_at"],
+    }
+
+
+@app.post("/destroy-approvals/{token}/approve")
+async def approve_destroy(token: str, request: Request):
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    access_token = auth_header.split(" ")[1].strip()
+    try:
+        user_res  = supabase.auth.get_user(access_token)
+        caller_id = str(user_res.user.id)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+    res = supabase.table("destroy_approvals")\
+        .select("*")\
+        .eq("token", token)\
+        .eq("status", "pending")\
+        .execute()
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Approval request not found, already actioned, or expired.")
+
+    approval = res.data[0]
+
+    if str(approval["admin_id"]) != caller_id:
+        raise HTTPException(status_code=403, detail="Only the project admin can approve this request.")
+
+    # Fetch admin name for the chat message
+    try:
+        admin_profile = supabase.table("user_profiles")\
+            .select("full_name")\
+            .eq("user_id", caller_id)\
+            .execute()
+        admin_name = admin_profile.data[0].get("full_name", "Admin") if admin_profile.data else "Admin"
+    except Exception:
+        admin_name = "Admin"
+
+    supabase.table("destroy_approvals")\
+        .update({"status": "approved"})\
+        .eq("token", token)\
+        .execute()
+
+    project_id  = approval["project_id"]
+    blueprint   = approval.get("blueprint") or {}
+    credentials = get_project_credentials(project_id)
+    job_id      = f"destroy-{uuid.uuid4()}"
+
+    supabase.table("jobs").insert({
+        "job_id":     job_id,
+        "project_id": project_id,
+        "job_type":   "DESTROY",
+        "status":     "RUNNING",
+        "env":        blueprint.get("environment") if blueprint else None,
+        "log_chunks": [],
+    }).execute()
+
+    # ── Post to chat feed ──────────────────────────────────────────────────
+    post_bot_chat_message(
+        project_id=project_id,
+        message_text=(
+            f"🔴 Destroy request from {approval['requested_by_name']} has been "
+            f"approved by {admin_name}. Infrastructure destruction is now in progress."
+        ),
+        job_id=job_id,
+    )
+
+    create_notification_for_user(
+        project_id=project_id,
+        user_id=str(approval["requested_by"]),
+        title="Destroy request approved",
+        message=f"The admin approved your destroy request. Infrastructure is being destroyed.",
+        type="WARNING",
+        metadata={"project_id": project_id, "job_id": job_id, "job_type": "DESTROY"},
     )
 
     threading.Thread(
@@ -1207,6 +1538,69 @@ def destroy_infra(payload: dict):
 
     return {"status": "accepted", "job_id": job_id}
 
+@app.post("/destroy-approvals/{token}/reject")
+async def reject_destroy(token: str, request: Request):
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    access_token = auth_header.split(" ")[1].strip()
+    try:
+        user_res  = supabase.auth.get_user(access_token)
+        caller_id = str(user_res.user.id)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+    res = supabase.table("destroy_approvals")\
+        .select("*")\
+        .eq("token", token)\
+        .eq("status", "pending")\
+        .execute()
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Approval request not found, already actioned, or expired.")
+
+    approval = res.data[0]
+
+    if str(approval["admin_id"]) != caller_id:
+        raise HTTPException(status_code=403, detail="Only the project admin can reject this request.")
+
+    # Fetch admin name for the chat message
+    try:
+        admin_profile = supabase.table("user_profiles")\
+            .select("full_name")\
+            .eq("user_id", caller_id)\
+            .execute()
+        admin_name = admin_profile.data[0].get("full_name", "Admin") if admin_profile.data else "Admin"
+    except Exception:
+        admin_name = "Admin"
+
+    supabase.table("destroy_approvals")\
+        .update({"status": "rejected"})\
+        .eq("token", token)\
+        .execute()
+
+    project_id = approval["project_id"]
+
+    # ── Post to chat feed ──────────────────────────────────────────────────
+    post_bot_chat_message(
+        project_id=project_id,
+        message_text=(
+            f"🛡️ Destroy request from {approval['requested_by_name']} has been "
+            f"rejected by {admin_name}. No infrastructure changes were made."
+        ),
+    )
+
+    create_notification_for_user(
+        project_id=project_id,
+        user_id=str(approval["requested_by"]),
+        title="Destroy request rejected",
+        message=f"The admin rejected your request to destroy infrastructure in this project.",
+        type="ERROR",
+        metadata={"project_id": project_id, "job_type": "DESTROY"},
+    )
+
+    return {"status": "rejected"}
 
 # =========================================================
 # FIX D: /status must return the shaped response the frontend expects.
@@ -1283,30 +1677,39 @@ def get_status(task_id: str):
         print(f"❌ /status/{task_id} failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch task status: {str(e)}")
 
-
-@app.get("/logs/{job_id}")
-def get_job_logs(job_id: str):
+@app.get("/logs/project/{project_id}")
+def get_project_logs(project_id: str):
+    # Fetch all jobs for this project, ordered by creation time
     res = (
         supabase.table("jobs")
-        .select("job_id, job_type, status, log_chunks")
-        .eq("job_id", job_id)
-        .single()
+        .select("job_id, job_type, status, log_chunks, created_at")
+        .eq("project_id", project_id)
+        .order("created_at", desc=False)
         .execute()
     )
 
     if not res.data:
-        return {"job_id": job_id, "chunks": [], "status": "NOT_FOUND"}
+        return {"project_id": project_id, "chunks": [], "status": "EMPTY"}
 
-    job = res.data
-    chunks = job.get("log_chunks") or []
+    all_chunks = []
+    
+    # Iterate through every job (init, plan, apply, destroy)
+    for job in res.data:
+        job_chunks = job.get("log_chunks") or []
+        # Each chunk in your DB is already {stage, stream, text}
+        # We just collect them all into one big array
+        for chunk in job_chunks:
+            # We add a timestamp from the job if the chunk doesn't have one
+            # to help the frontend maintain order
+            chunk["job_id"] = job["job_id"]
+            all_chunks.append(chunk)
 
+    # Return the flattened list of all logs across all jobs
     return {
-        "job_id": job["job_id"],
-        "job_type": job.get("job_type"),
-        "status": job.get("status"),
-        "chunks": chunks,
+        "project_id": project_id,
+        "chunks": all_chunks,
+        "status": res.data[-1]["status"] if res.data else "UNKNOWN"
     }
-
 
 @app.get("/projects")
 async def get_projects(request: Request):
@@ -1395,7 +1798,139 @@ async def get_projects(request: Request):
 
     except Exception as e:
         print(f"🚨 Error fetching projects: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch projects")    
+        raise HTTPException(status_code=500, detail="Failed to fetch projects")  
+    
+@app.post("/projects/{project_id}/members/invite")
+def invite_members(project_id: str, payload: dict, user=Depends(get_current_user)):
+    emails = payload.get("emails", [])
+
+    if not emails:
+        raise HTTPException(status_code=400, detail="No emails provided")
+
+    # 🔐 Ensure only project owner (admin) can invite
+    project_res = supabase.table("projects")\
+        .select("project_name, user_id")\
+        .eq("project_id", project_id)\
+        .execute()
+
+    if not project_res.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project = project_res.data[0]
+
+    if str(project["user_id"]) != str(user.id):
+        raise HTTPException(status_code=403, detail="Only admin can invite members")
+
+    project_name = project["project_name"]
+
+    for email in emails:
+        try:
+            # 🔥 Prevent duplicate accepted users
+            existing = supabase.table("project_invitations")\
+                .select("status")\
+                .eq("project_id", project_id)\
+                .eq("email", email)\
+                .execute()
+
+            if existing.data and existing.data[0]["status"] == "accepted":
+                continue
+
+            invite_token = str(uuid.uuid4())
+
+            # Upsert invite
+            supabase.table("project_invitations").upsert({
+                "token": invite_token,
+                "project_id": project_id,
+                "email": email,
+                "invited_by": str(user.id),
+                "status": "pending"
+            }, on_conflict="project_id,email").execute()
+
+            # Send email
+            send_invitation_email(
+                target_email=email,
+                project_name=project_name,
+                inviter_email=user.email,
+                invite_token=invite_token
+            )
+
+        except Exception as e:
+            print(f"❌ Invite failed for {email}: {e}")
+
+    return {"success": True}
+
+@app.get("/projects/{project_id}/members")
+def get_members(project_id: str, user=Depends(get_current_user)):
+
+    res = supabase.table("project_members")\
+        .select("""
+            user_id,
+            added_at,
+            user_profiles (
+                full_name,
+                email
+            )
+        """)\
+        .eq("project_id", project_id)\
+        .execute()
+
+    members = []
+
+    for m in res.data or []:
+        profile = m.get("user_profiles") or {}
+        members.append({
+            "user_id": m["user_id"],
+            "name": profile.get("full_name"),
+            "email": profile.get("email"),
+            "added_at": m["added_at"]
+        })
+
+    return {"members": members}
+
+@app.post("/projects/{project_id}/members")
+def add_member(project_id: str, payload: dict, user=Depends(get_current_user)):
+    new_user_id = payload.get("user_id")
+    role = payload.get("role", "cloud_architect")
+
+    supabase.table("project_members").insert({
+        "project_id": project_id,
+        "user_id": new_user_id,
+        "role": role
+    }).execute()
+
+    return {"success": True}
+
+
+@app.delete("/projects/{project_id}/members/{user_id}")
+def remove_member(project_id: str, user_id: str, user=Depends(get_current_user)):
+
+    # 1. Check project exists
+    project_res = supabase.table("projects")\
+        .select("user_id")\
+        .eq("project_id", project_id)\
+        .execute()
+
+    if not project_res.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_owner = project_res.data[0]["user_id"]
+
+    # 2. Only admin can remove
+    if str(project_owner) != str(user.id):
+        raise HTTPException(status_code=403, detail="Only admin can remove members")
+
+    # 3. Prevent self removal (optional but recommended)
+    if str(user_id) == str(user.id):
+        raise HTTPException(status_code=400, detail="Cannot remove yourself")
+
+    # 4. Delete member
+    supabase.table("project_members")\
+        .delete()\
+        .eq("project_id", project_id)\
+        .eq("user_id", user_id)\
+        .execute()
+
+    return {"success": True}
 
 @app.get("/chats/{project_id}")
 def get_chat_history(project_id: str, user=Depends(get_current_user)):

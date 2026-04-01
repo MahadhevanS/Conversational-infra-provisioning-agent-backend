@@ -454,7 +454,7 @@ def lex_webhook(event):
         if is_yes:
             bp = json.loads(attrs.get("infra_blueprint", "{}"))
             logger.info(f"PLAN CONFIRM yes -- bp keys: {list(bp.keys())}")
-            result, error = call_backend(BACK_PLAN_URL, {"project_id": attrs["project_id"], "infra_blueprint": bp})
+            result, error = call_backend(BACK_PLAN_URL, {"project_id": attrs["project_id"], "infra_blueprint": bp, "user_id": attrs.get("caller_user_id")})
             if error:
                 attrs["conversation_state"] = STATE_IDLE
                 return build_response(intent_name, f"Request failed: {error}", attrs)
@@ -470,28 +470,53 @@ def lex_webhook(event):
     # ── Destroy confirmation (dedicated state — never mixed with plan confirm) ─
     if state == STATE_WAITING_DESTROY_CONFIRM:
         if is_yes:
-            scope = attrs.get("pending_destroy_scope", "ALL")
+            scope      = attrs.get("pending_destroy_scope", "ALL")
             project_id = attrs["project_id"]
 
+            # ── RBAC: read caller identity from session attributes ──────────
+            # ConsoleLayout passes these via sessionState.sessionAttributes
+            # when it calls RecognizeTextCommand.
+            caller_user_id = attrs.get("caller_user_id", "")
+            caller_role    = attrs.get("caller_role", "admin")
+
             if scope == "ALL":
-                payload = {"project_id": project_id}
+                payload = {
+                    "project_id":    project_id,
+                    "caller_user_id": caller_user_id,
+                    "caller_role":    caller_role,
+                    "scope":          "ALL",
+                }
             else:
-                # Partial destroy — send the updated blueprint (targets already removed)
                 bp = json.loads(attrs.get("infra_blueprint", "{}"))
-                payload = {"project_id": project_id, "infra_blueprint": bp}
+                payload = {
+                    "project_id":    project_id,
+                    "infra_blueprint": bp,
+                    "caller_user_id": caller_user_id,
+                    "caller_role":    caller_role,
+                    "scope":          "PARTIAL",
+                }
 
             result, error = call_backend(BACK_DESTROY_URL, payload)
             if error:
                 attrs["conversation_state"] = STATE_IDLE
                 return build_response(intent_name, f"Destroy request failed: {error}", attrs)
 
-            # Clean up destroy-specific session state
-            attrs.update({"job_id": result.get("job_id"), "conversation_state": STATE_IDLE})
+            attrs.update({"conversation_state": STATE_IDLE})
             attrs.pop("pending_destroy_scope", None)
             attrs.pop("pending_destroy_targets", None)
             attrs.pop("infra_blueprint", None)
 
+            # ── Branch response based on what the backend returned ──────────
+            if result.get("status") == "pending_approval":
+                return build_response(
+                    intent_name,
+                    "✅ Your destroy request has been sent to the project admin for approval. You'll be notified once they respond.",
+                    attrs,
+                    {"type": "DESTROY_APPROVAL_PENDING"}
+                )
+
             scope_label = "FULL environment" if scope == "ALL" else "selected resources"
+            attrs["job_id"] = result.get("job_id")
             return build_response(
                 intent_name,
                 f"Initiating destruction of {scope_label}...",
