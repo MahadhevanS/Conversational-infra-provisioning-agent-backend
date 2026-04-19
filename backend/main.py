@@ -96,82 +96,6 @@ def get_project_credentials(project_id):
     return cred_res.data[0]
 
 
-# --- NOTIFICATION HELPERS ---
-
-def get_project_user_id(project_id):
-    try:
-        print(f"🔎 Fetching user_id for project_id={project_id}")
-        res = (
-            supabase.table("projects")
-            .select("user_id")
-            .eq("project_id", project_id)
-            .execute()
-        )
-        if not res.data:
-            print(f"⚠️ No project found for project_id={project_id}")
-            return None
-        user_id = res.data[0].get("user_id")
-        print(f"✅ Found user_id={user_id} for project_id={project_id}")
-        return user_id
-    except Exception as e:
-        print(f"❌ Failed to fetch user_id for project {project_id}: {e}")
-        return None
-
-
-def build_notification_key(title, metadata=None):
-    metadata = metadata or {}
-    safe_title = str(title).strip().upper().replace(" ", "_")
-    return "|".join([
-        safe_title,
-        str(metadata.get("job_type", "")),
-        str(metadata.get("job_id", "")),
-        str(metadata.get("run_id", "")),
-        str(metadata.get("plan_job_id", "")),
-        str(metadata.get("project_id", "")),
-    ])
-
-
-def create_notification_for_user(project_id,user_id, title, message, type="INFO", metadata=None):
-    try:
-        if not user_id:
-            print("⚠️ Skipping notification because user_id is missing")
-            return
-
-        metadata = metadata or {}
-        notification_key = build_notification_key(title, metadata)
-
-        existing = (
-            supabase.table("notifications")
-            .select("id, is_deleted")
-            .eq("user_id", str(user_id))
-            .eq("notification_key", notification_key)
-            .execute()
-        )
-
-        if existing.data:
-            print(f"⚠️ Notification already exists for key={notification_key} -> skipping")
-            return
-
-        insert_payload = {
-            "user_id": str(user_id),
-            "project_id": str(project_id),
-            "title": str(title),
-            "message": str(message),
-            "type": str(type),
-            "is_read": False,
-            "is_deleted": False,
-            "notification_key": notification_key,
-            "metadata": metadata,
-        }
-
-        print(f"🔔 Inserting notification: {insert_payload}")
-        result = supabase.table("notifications").insert(insert_payload).execute()
-        print(f"✅ Notification insert result: {result.data}")
-    except Exception as e:
-        print(f"❌ Notification creation failed: {e}")
-
-
-
 # --- WORKERS WITH PERSISTENCE ---
 
 def update_job_status(job_id, status, result=None):
@@ -200,62 +124,43 @@ def _fetch_log_chunks(job_id: str) -> list:
     return []
 
 
-def _fire_ai_analysis(project_id: str, job_id: str, job_type: str):
+def _fire_ai_analysis(project_id: str, job_id: str, job_type: str, write_job_id: str = None):
     """
-    Spawn a daemon thread that:
-      1. Calls OpenAI to analyse the failure logs.
-      2. Posts the result as a BOT chat message in the project.
-      3. Attaches the result to the existing failure notification's metadata.
+    Spawn a daemon thread that analyses the Terraform failure logs and saves
+    the result to the DB so the frontend can render it in DeploymentFailureView.
+
+    Args:
+        job_id       – Job whose log_chunks to read (the log-root job).
+        write_job_id – Job row to write ai_analysis into (the status job the
+                       frontend polls). Defaults to job_id when omitted.
 
     Fire-and-forget — never blocks the worker that calls it.
     """
+    # The row the frontend polls for /status is the write target.
+    # For APPLY/DESTROY the logs live in the plan/log job, but status lives
+    # in the apply/destroy job — so we need two different ids.
+    target_job_id = write_job_id or job_id
+
     def _run():
-        print(f"🤖 AI analysis started for {job_type} job {job_id}")
+        print(f"🤖 AI analysis started for {job_type} job {job_id} (writing to {target_job_id})")
 
         log_chunks = _fetch_log_chunks(job_id)
         analysis = analyse_failure(job_id=job_id, job_type=job_type, log_chunks=log_chunks)
 
-        root_cause = analysis.get("root_cause", "Unknown error")
-        fix_steps = analysis.get("fix_steps", [])
-        category = analysis.get("category", "unknown")
-
         structured = {
-            "root_cause": root_cause,
-            "fix_steps": fix_steps,
-            "category": category,
+            "root_cause": analysis.get("root_cause", "Unknown error"),
+            "fix_steps":  analysis.get("fix_steps", []),
+            "category":   analysis.get("category", "unknown"),
         }
 
-        # ── 1. Persist structured analysis on the job row ─────────────────
-        # Primary data source: /status returns it, loadChatHistory reads it,
-        # DeploymentFailureView renders it. No text parsing needed anywhere.
+        # Persist to the job row that the frontend polls via /status
         try:
             supabase.table("jobs").update({
                 "ai_analysis": structured
-            }).eq("job_id", job_id).execute()
-            print(f"✅ AI analysis saved to job row for {job_id}")
+            }).eq("job_id", target_job_id).execute()
+            print(f"✅ AI analysis saved to job row {target_job_id}")
         except Exception as e:
-            print(f"❌ Failed to save AI analysis to job row: {e}")
-
-        # ── 2. Attach analysis to the failure notification metadata ────────
-        try:
-            notif_res = (
-                supabase.table("notifications")
-                .select("id, metadata")
-                .eq("metadata->>job_id", job_id)
-                .eq("type", "ERROR")
-                .order("created_at", desc=True)
-                .limit(1)
-                .execute()
-            )
-            if notif_res.data:
-                existing_meta = notif_res.data[0].get("metadata") or {}
-                existing_meta["ai_analysis"] = structured
-                supabase.table("notifications").update({
-                    "metadata": existing_meta
-                }).eq("id", notif_res.data[0]["id"]).execute()
-                print(f"✅ AI analysis attached to notification for job {job_id}")
-        except Exception as e:
-            print(f"❌ Failed to attach AI analysis to notification: {e}")
+            print(f"❌ Failed to save AI analysis to job row {target_job_id}: {e}")
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -273,40 +178,16 @@ def run_plan_worker(project_id, job_id, blueprint, credentials=None, triggered_b
         if "error" in result:
             update_job_status(job_id, "FAILED", result["error"])
 
-            create_notification_for_user(
-                project_id=project_id,
-                user_id=triggered_by,
-                title="PLAN failed",
-                message=f"PLAN job failed for project {project_id}",
-                type="ERROR",
-                metadata={"job_id": job_id, "job_type": "PLAN"},
-            )
 
             _fire_ai_analysis(project_id, job_id, "PLAN")
 
         else:
             update_job_status(job_id, "COMPLETED", result["structured_plan"])
 
-            create_notification_for_user(
-                project_id=project_id,
-                user_id=triggered_by,
-                title="PLAN completed",
-                message=f"PLAN job completed for project {project_id}",
-                type="SUCCESS",
-                metadata={"job_id": job_id, "job_type": "PLAN"},
-            )
 
     except Exception as e:
         update_job_status(job_id, "FAILED", str(e))
 
-        create_notification_for_user(
-            project_id=project_id,
-            user_id=triggered_by,
-            title="PLAN failed",
-            message=f"PLAN job failed for project {project_id}",
-            type="ERROR",
-            metadata={"job_id": job_id, "job_type": "PLAN"},
-        )
 
         _fire_ai_analysis(project_id, job_id, "PLAN")
 
@@ -334,52 +215,15 @@ def run_apply_worker(project_id, job_id, plan_job_id, blueprint, credentials=Non
 
         if "error" in result:
             update_job_status(job_id, "FAILED", result)
-
-            create_notification_for_user(
-                project_id=project_id,
-                user_id=triggered_by,
-                title="Deployment failed",
-                message=f"Infrastructure deployment failed for project {project_id}",
-                type="ERROR",
-                metadata={
-                    "job_id": plan_job_id,   # ✅ FIXED
-                    "job_type": "APPLY"
-                },
-            )
-
-            _fire_ai_analysis(project_id, plan_job_id, "APPLY")
+            # Logs live in plan_job_id; status (and ai_analysis) must go to job_id
+            _fire_ai_analysis(project_id, plan_job_id, "APPLY", write_job_id=job_id)
 
         else:
             update_job_status(job_id, "COMPLETED", result)
 
-            create_notification_for_user(
-                project_id=project_id,
-                user_id=triggered_by,
-                title="Deployment completed",
-                message=f"Infrastructure deployed for project {project_id}",
-                type="SUCCESS",
-                metadata={
-                    "job_id": plan_job_id,   # ✅ FIXED
-                    "job_type": "APPLY"
-                },
-            )
-
     except Exception as e:
         update_job_status(job_id, "FAILED", str(e))
-
-        create_notification_for_user(
-            project_id=project_id,
-            user_id=triggered_by,
-            title="Deployment failed",
-            message=f"Infrastructure deployment failed for project {project_id}",
-            type="ERROR",
-            metadata={
-                "job_id": plan_job_id,   # ✅ FIXED
-                "job_type": "APPLY"
-            },
-        )
-
-        _fire_ai_analysis(project_id, plan_job_id, "APPLY")
+        _fire_ai_analysis(project_id, plan_job_id, "APPLY", write_job_id=job_id)
 
 
 # ===============================
@@ -395,38 +239,14 @@ def run_cost_worker(project_id, job_id, run_id, blueprint, credentials=None, tri
         if "error" in result:
             update_job_status(job_id, "FAILED", result)
 
-            create_notification_for_user(
-                project_id=project_id,
-                user_id=triggered_by,
-                title="Cost estimation failed",
-                message=f"Cost estimation failed for project {project_id}",
-                type="ERROR",
-                metadata={"job_id": job_id, "job_type": "COST"},
-            )
 
         else:
             update_job_status(job_id, "COMPLETED", result)
 
-            create_notification_for_user(
-                project_id=project_id,
-                user_id=triggered_by,
-                title="Cost estimation ready",
-                message=f"Cost estimation completed for project {project_id}",
-                type="SUCCESS",
-                metadata={"job_id": job_id, "job_type": "COST"},
-            )
 
     except Exception as e:
         update_job_status(job_id, "FAILED", str(e))
 
-        create_notification_for_user(
-            project_id=project_id,
-            user_id=triggered_by,
-            title="Cost estimation failed",
-            message=f"Cost estimation crashed for project {project_id}.",
-            type="ERROR",
-            metadata={"job_id": job_id, "job_type": "COST"},
-        )
 
 
 # ===============================
@@ -453,52 +273,15 @@ def run_destroy_worker(project_id, job_id, blueprint, credentials=None, triggere
 
         if isinstance(result, dict) and "error" in result:
             update_job_status(job_id, "FAILED", result.get("error"))
-
-            create_notification_for_user(
-                project_id=project_id,
-                user_id=triggered_by,
-                title="Destroy failed",
-                message=f"Infrastructure destruction failed for project {project_id}",
-                type="ERROR",
-                metadata={
-                    "job_id": log_job_id,   # ✅ FIXED
-                    "job_type": "DESTROY"
-                },
-            )
-
-            _fire_ai_analysis(project_id, log_job_id, "DESTROY")
+            # Logs live in log_job_id; status (and ai_analysis) must go to job_id
+            _fire_ai_analysis(project_id, log_job_id, "DESTROY", write_job_id=job_id)
 
         else:
             update_job_status(job_id, "COMPLETED", result)
 
-            create_notification_for_user(
-                project_id=project_id,
-                user_id=triggered_by,
-                title="Destroy completed",
-                message=f"Infrastructure destroyed for project {project_id}",
-                type="SUCCESS",
-                metadata={
-                    "job_id": log_job_id,   # ✅ FIXED
-                    "job_type": "DESTROY"
-                },
-            )
-
     except Exception as e:
         update_job_status(job_id, "FAILED", str(e))
-
-        create_notification_for_user(
-            project_id=project_id,
-            user_id=triggered_by,
-            title="Destroy failed",
-            message=f"Infrastructure destruction crashed for project {project_id}.",
-            type="ERROR",
-            metadata={
-                "job_id": log_job_id,   # ✅ FIXED
-                "job_type": "DESTROY"
-            },
-        )
-
-        _fire_ai_analysis(project_id, log_job_id, "DESTROY")
+        _fire_ai_analysis(project_id, log_job_id, "DESTROY", write_job_id=job_id)
 
 def post_bot_chat_message(project_id: str, message_text: str, job_id: str = None):
     """Save a CloudCrafter bot message to the project chat feed."""
@@ -515,168 +298,6 @@ def post_bot_chat_message(project_id: str, message_text: str, job_id: str = None
         supabase.table("chat_messages").insert(insert_data).execute()
     except Exception as e:
         print(f"⚠️ Failed to post bot chat message: {e}")
-
-# --- NOTIFICATION MODELS ---
-
-class NotificationCreate(BaseModel):
-    user_id: str
-    title: str
-    message: str
-    type: Optional[str] = "INFO"
-    metadata: Optional[Dict[str, Any]] = None
-
-
-# --- ROUTES ---
-
-@app.post("/notifications")
-def create_notification(payload: NotificationCreate, user=Depends(get_current_user)):
-    try:
-        if str(user.id) != str(payload.user_id):
-            raise HTTPException(status_code=403, detail="Unauthorized access")
-
-        metadata = payload.metadata or {}
-        notification_key = build_notification_key(payload.title, metadata)
-
-        insert_payload = {
-            "user_id": payload.user_id,
-            "title": payload.title,
-            "message": payload.message,
-            "type": payload.type or "INFO",
-            "is_read": False,
-            "notification_key": notification_key,
-            "metadata": metadata,
-        }
-
-        res = (
-            supabase.table("notifications")
-            .upsert(insert_payload, on_conflict="user_id,notification_key")
-            .execute()
-        )
-
-        return {"success": True, "notification": res.data[0] if res.data else None}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create notification: {str(e)}")
-
-
-@app.get("/notifications")
-def get_notifications(user=Depends(get_current_user)):
-    try:
-        res = (
-            supabase.table("notifications")
-            .select("id, user_id, project_id, job_id, title, message, type, is_read, is_deleted, created_at, metadata, notification_key")
-            .eq("user_id", str(user.id))
-            .eq("is_deleted", False)
-            .order("created_at", desc=True)
-            .execute()
-        )
-
-        return {"success": True, "notifications": res.data or []}
-
-    except Exception as e:
-        print(f"❌ /notifications failed: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch notifications")
-
-@app.get("/notifications/unread-count")
-def get_unread_count(user=Depends(get_current_user)):
-    try:
-        res = (
-            supabase.table("notifications")
-            .select("id")
-            .eq("user_id", str(user.id))
-            .eq("is_read", False)
-            .eq("is_deleted", False)
-            .execute()
-        )
-
-        return {"success": True, "unread_count": len(res.data or [])}
-
-    except Exception as e:
-        print(f"❌ unread-count failed: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch unread count")
-
-
-@app.put("/notifications/read-all")
-def mark_all_notifications_read(user=Depends(get_current_user)):
-    supabase.table("notifications")\
-        .update({"is_read": True})\
-        .eq("user_id", str(user.id))\
-        .eq("is_deleted", False)\
-        .execute()
-
-    return {"success": True}
-
-@app.delete("/notifications/clear-all")
-def clear_all_notifications(user=Depends(get_current_user)):
-    supabase.table("notifications")\
-        .update({"is_deleted": True})\
-        .eq("user_id", str(user.id))\
-        .execute()
-
-    return {"success": True}
-
-@app.delete("/notifications/{notification_id}")
-def delete_notification(notification_id: str, user=Depends(get_current_user)):
-    try:
-        existing = (
-            supabase.table("notifications")
-            .select("id, user_id, is_deleted")
-            .eq("id", notification_id)
-            .execute()
-        )
-
-        if not existing.data:
-            return {"success": True}
-
-        if str(existing.data[0]["user_id"]) != str(user.id):
-            raise HTTPException(status_code=403, detail="Unauthorized access")
-
-        supabase.table("notifications").update({"is_deleted": True}).eq("id", notification_id).execute()
-        print(f"🗑️ Soft-deleted notification {notification_id}")
-        return {"success": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ delete notification failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to delete notification: {str(e)}")
-
-
-@app.put("/notifications/{notification_id}/read")
-def mark_notification_read(notification_id: str, user=Depends(get_current_user)):
-    try:
-        existing = (
-            supabase.table("notifications")
-            .select("id, user_id, is_deleted")
-            .eq("id", notification_id)
-            .execute()
-        )
-
-        if not existing.data:
-            raise HTTPException(status_code=404, detail="Notification not found")
-
-        notification = existing.data[0]
-
-        if str(notification["user_id"]) != str(user.id):
-            raise HTTPException(status_code=403, detail="Unauthorized access")
-
-        if notification.get("is_deleted"):
-            return {"success": True, "notification": None}
-
-        res = (
-            supabase.table("notifications")
-            .update({"is_read": True})
-            .eq("id", notification_id)
-            .execute()
-        )
-
-        return {"success": True, "notification": res.data[0] if res.data else None}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ /notifications/{{id}}/read failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to mark notification as read: {str(e)}")
-
 
 @app.post("/signup")
 def signup(payload: dict):
@@ -1086,11 +707,15 @@ def plan_infra(payload: dict):
     if not project_id:
         raise HTTPException(status_code=400, detail="project_id required")
 
+    # ✅ FIX: look up user_id from the project record.
+    # This works for both the Lex webhook (server→server, no auth header)
+    # and direct frontend calls without requiring a token on this endpoint.
+    triggered_by = get_project_user_id(project_id)
+
     credentials = get_project_credentials(project_id)
     env = blueprint.get("environment", "dev")
     job_id = f"plan-{uuid.uuid4()}"
 
-    # FIX E: initialise log_chunks so LogPanel never gets null on first poll
     supabase.table("jobs").insert({
         "job_id": job_id,
         "project_id": project_id,
@@ -1100,19 +725,11 @@ def plan_infra(payload: dict):
         "log_chunks": [],
     }).execute()
 
-    create_notification_for_user(
-        project_id=project_id,
-        user_id=payload.get("user_id"),
-        title="PLAN started",
-        message=f"PLAN job has started in {env}.",
-        type="INFO",
-        metadata={"job_id": job_id, "job_type": "PLAN"},
-    )
 
     threading.Thread(
         target=run_plan_worker,
         args=(project_id, job_id, blueprint, credentials),
-        kwargs={"triggered_by": payload.get("user_id")},
+        kwargs={"triggered_by": triggered_by},
         daemon=True
     ).start()
 
@@ -1130,6 +747,9 @@ def cost_infra(payload: dict):
     if not run_id:
         raise HTTPException(status_code=400, detail="run_id required")
 
+    # ✅ FIX: look up user_id from the project record
+    triggered_by = get_project_user_id(project_id)
+
     credentials = get_project_credentials(project_id)
     job_id = f"cost-{uuid.uuid4()}"
 
@@ -1143,19 +763,11 @@ def cost_infra(payload: dict):
         "log_chunks": [],
     }).execute()
 
-    create_notification_for_user(
-        project_id=project_id,
-        user_id=payload.get("user_id"),
-        title="Cost estimation started",
-        message=f"Cost estimation has started for project {project_id}.",
-        type="INFO",
-        metadata={"job_id": job_id, "job_type": "COST", "run_id": run_id},
-    )
-    
+
     threading.Thread(
         target=run_cost_worker,
         args=(project_id, job_id, run_id, blueprint, credentials),
-        kwargs={"triggered_by": payload.get("user_id")},
+        kwargs={"triggered_by": triggered_by},
         daemon=True,
     ).start()
 
@@ -1174,8 +786,8 @@ def apply_infra(payload: dict):
     if not plan_job_id:
         raise HTTPException(status_code=400, detail="Plan Job ID required")
 
-    # FIX G: blueprint is optional — the workspace already exists from the plan step.
-    # Removing the hard 400 that broke applies when the frontend omits the blueprint.
+    # ✅ FIX: look up user_id from the project record
+    triggered_by = get_project_user_id(project_id)
 
     credentials = get_project_credentials(project_id)
     job_id = f"apply-{uuid.uuid4()}"
@@ -1190,19 +802,11 @@ def apply_infra(payload: dict):
         "log_chunks": [],
     }).execute()
 
-    create_notification_for_user(
-        project_id=project_id,
-        user_id=payload.get("user_id"),
-        title="Deployment started",
-        message=f"Deployment has started for project {project_id}.",
-        type="INFO",
-        metadata={"job_id": job_id, "job_type": "APPLY", "plan_job_id": plan_job_id},
-    )
 
     threading.Thread(
         target=run_apply_worker,
         args=(project_id, job_id, plan_job_id, blueprint, credentials),
-        kwargs={"triggered_by": payload.get("user_id")},
+        kwargs={"triggered_by": triggered_by},
         daemon=True,
     ).start()
 
@@ -1218,7 +822,10 @@ def destroy_infra(payload: dict, request: Request):
 
     credentials = get_project_credentials(project_id)
 
-    caller_user_id = payload.get("caller_user_id")
+    # caller_user_id comes from the Lex session attribute (set by the frontend
+    # in talkToLex → caller_user_id: currentUserId). This is fine for routing
+    # the architect vs admin path. For notifications we also use project lookup.
+    caller_user_id = payload.get("caller_user_id") or get_project_user_id(project_id)
     caller_role    = payload.get("caller_role", "admin")
 
     # ── Architect path → approval request ─────────────────────────────────
@@ -1360,14 +967,6 @@ def destroy_infra(payload: dict, request: Request):
         )
 
         # Notify the architect
-        create_notification_for_user(
-            project_id=project_id,
-            user_id=caller_user_id,
-            title="Destroy approval requested",
-            message=f"Your request to destroy infrastructure in '{project_name}' has been sent to {admin_name} for approval.",
-            type="INFO",
-            metadata={"project_id": project_id, "job_type": "DESTROY_APPROVAL"},
-        )
 
         return {
             "status":          "pending_approval",
@@ -1389,14 +988,6 @@ def destroy_infra(payload: dict, request: Request):
 
     print(f"🔥 Destroy request accepted for project_id={project_id}, job_id={job_id}")
 
-    create_notification_for_user(
-        project_id=project_id,
-        user_id=caller_user_id,
-        title="Destroy started",
-        message=f"Infrastructure destruction has started for project {project_id}.",
-        type="INFO",
-        metadata={"job_id": job_id, "job_type": "DESTROY"},
-    )
 
     threading.Thread(
         target=run_destroy_worker,
@@ -1521,15 +1112,6 @@ async def approve_destroy(token: str, request: Request):
         job_id=job_id,
     )
 
-    create_notification_for_user(
-        project_id=project_id,
-        user_id=str(approval["requested_by"]),
-        title="Destroy request approved",
-        message=f"The admin approved your destroy request. Infrastructure is being destroyed.",
-        type="WARNING",
-        metadata={"project_id": project_id, "job_id": job_id, "job_type": "DESTROY"},
-    )
-
     threading.Thread(
         target=run_destroy_worker,
         args=(project_id, job_id, blueprint, credentials),
@@ -1591,14 +1173,6 @@ async def reject_destroy(token: str, request: Request):
         ),
     )
 
-    create_notification_for_user(
-        project_id=project_id,
-        user_id=str(approval["requested_by"]),
-        title="Destroy request rejected",
-        message=f"The admin rejected your request to destroy infrastructure in this project.",
-        type="ERROR",
-        metadata={"project_id": project_id, "job_type": "DESTROY"},
-    )
 
     return {"status": "rejected"}
 
@@ -1985,9 +1559,14 @@ def get_chat_history(project_id: str, user=Depends(get_current_user)):
 
     for msg in messages:
         if msg.get("job_id") and msg["job_id"] in jobs_map:
-            msg["job_details"] = jobs_map[msg["job_id"]]
-            if msg["job_details"]["job_type"] == "PLAN" and msg["job_id"] in cost_map:
+            job = jobs_map[msg["job_id"]]
+            msg["job_details"] = job
+            if job["job_type"] == "PLAN" and msg["job_id"] in cost_map:
                 msg["job_details"]["cost_summary"] = cost_map[msg["job_id"]]
+            # ✅ FIX: surface ai_analysis so DeploymentFailureView can render it
+            # on history load without a separate /status poll
+            if job.get("ai_analysis"):
+                msg["ai_analysis"] = job["ai_analysis"]
 
     return {"messages": messages}
 
@@ -2077,17 +1656,5 @@ def discard_job(job_id: str, user=Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Unauthorized access")
 
     supabase.table("jobs").update({"status": "DISCARDED"}).eq("job_id", job_id).execute()
-
-    create_notification_for_user(
-        user_id=str(user.id),
-        title="Job discarded",
-        message=f"{job['job_type']} job was discarded for project {job['project_id']}.",
-        type="WARNING",
-        metadata={
-            "job_id": job["job_id"],
-            "job_type": job["job_type"],
-            "project_id": job["project_id"],
-        },
-    )
 
     return {"status": "success"}

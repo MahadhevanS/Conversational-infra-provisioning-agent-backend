@@ -110,16 +110,24 @@ def call_backend_get(url):
 
 def build_response(intent_name, message, attrs, payload=None):
     """
-    If payload is provided, it MUST include a "message" key — otherwise the
-    frontend will read payload.message as undefined and render an empty bubble.
-    When no payload is needed, omit it entirely so the plain messages[] path is used.
+    Build a Lex V2 response.
+
+    The `message` string is ALWAYS written into:
+      1. attrs["ui_payload"]["message"]  — read by ConsoleLayout via sessionAttributes
+      2. The top-level `messages` array  — Lex V2 native channel (fallback)
+
+    Both paths are populated so the frontend can reliably extract the text
+    regardless of which channel it reads first.
     """
+    # Guard: message must never be None or empty here — callers should
+    # always pass a non-empty string, but be defensive.
+    safe_message = message or ""
+
     if payload:
-        # Always inject the message into the payload so the frontend can read it
-        payload["message"] = message
+        payload["message"] = safe_message
         attrs["ui_payload"] = json.dumps(payload)
     else:
-        attrs["ui_payload"] = json.dumps({"type": "MESSAGE", "message": message})
+        attrs["ui_payload"] = json.dumps({"type": "MESSAGE", "message": safe_message})
 
     return {
         "sessionState": {
@@ -127,7 +135,11 @@ def build_response(intent_name, message, attrs, payload=None):
             "dialogAction": {"type": "Close"},
             "intent": {"name": intent_name, "state": "Fulfilled"}
         },
-        "messages": [{"contentType": "PlainText", "content": message}]
+        # ── FIX: always populate the Lex V2 messages array ──────────────────
+        # Lex V2 expects: [{"contentType": "PlainText", "content": "<text>"}]
+        # The frontend reads response.messages[0].content as a fallback when
+        # ui_payload.message is missing or empty.
+        "messages": [{"contentType": "PlainText", "content": safe_message}]
     }
 
 # =====================================================
@@ -474,8 +486,6 @@ def lex_webhook(event):
             project_id = attrs["project_id"]
 
             # ── RBAC: read caller identity from session attributes ──────────
-            # ConsoleLayout passes these via sessionState.sessionAttributes
-            # when it calls RecognizeTextCommand.
             caller_user_id = attrs.get("caller_user_id", "")
             caller_role    = attrs.get("caller_role", "admin")
 
