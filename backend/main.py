@@ -96,6 +96,21 @@ def get_project_credentials(project_id):
     return cred_res.data[0]
 
 
+def get_project_user_id(project_id: str) -> str:
+    """Return the owner user_id for a given project_id."""
+    project_res = (
+        supabase.table("projects")
+        .select("user_id")
+        .eq("project_id", project_id)
+        .execute()
+    )
+
+    if not project_res.data:
+        raise HTTPException(status_code=404, detail=f"Project not found for id: {project_id}")
+
+    return project_res.data[0]["user_id"]
+
+
 # --- WORKERS WITH PERSISTENCE ---
 
 def update_job_status(job_id, status, result=None):
